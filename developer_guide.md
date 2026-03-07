@@ -878,11 +878,74 @@ The firmware is downloaded via a standard HTTP/TCP socket. We **write the binary
 *   The STM32's `Task_Net` uses the **SPI Bus** to slowly stream 1 Kilobyte chunks out of the W5500 and into a tiny temporary RAM `chunkBuffer`.
 *   The STM32 instantly writes that 1KB chunk directly into the physical Flash memory of Bank 2 using `HAL_FLASH_Program()`.
 
+> **❓ "What is the W5500's internal buffer capacity? Does it download all 384KB first, then hand it to STM32? Or is it chunk-by-chunk?"**
+>
+> **Neither — it is a continuously flowing pipeline governed by TCP flow control.** The W5500 cannot store 384KB. It physically only has **32KB of total internal RX+TX buffer** split across all 8 sockets.
+>
+> **W5500 Internal Buffer Architecture:**
+>
+> The W5500 has 32KB of RX buffer and 32KB of TX buffer built into its silicon, shared across all 8 hardware sockets. Each socket's allocation is configurable, but the total is fixed at **16KB maximum RX per socket** if you dedicate the full pool to one socket:
+>
+> ```
+> W5500 Internal Memory (fixed silicon — 64KB total):
+> ┌─────────────────────────────────────────────────────────┐
+> │  RX Buffer Pool: 16KB total (shared across 8 sockets)   │
+> │    Socket 0 (MQTT):  2KB RX ← permanent MQTT connection │
+> │    Socket 1 (OTA):  14KB RX ← maximised for OTA speed  │
+> │    Sockets 2–7:      0KB   ← unused in this project    │
+> │                                                         │
+> │  TX Buffer Pool: 16KB total (shared across 8 sockets)   │
+> │    Socket 0 (MQTT):  2KB TX ← for publishing telemetry  │
+> │    Socket 1 (OTA):   2KB TX ← for HTTP GET request     │
+> └─────────────────────────────────────────────────────────┘
+>              Total = 32KB RX + 32KB TX = 64KB combined
+>              The OTA binary is 384KB — far too large to buffer here
+> ```
+>
+> **The actual flow — a 3-stage pipeline:**
+>
+> ```
+> Stage 1: Cloud Server ──────────────────▶ W5500 Silicon RX Buffer (14KB)
+>          TCP packets arrive at Ethernet     W5500 TCP hardware fills this buffer.
+>          speed (~100Mbps)                   When buffer approaches full, W5500
+>                                             shrinks the TCP receive window
+>                                             → server throttles automatically
+>
+> Stage 2: W5500 RX Buffer ──SPI──────────▶ STM32 chunkBuffer[1024] (1KB in SRAM)
+>          SPI clock @ ~10-20MHz             Task_Net issues SPI read commands:
+>          (slower than Ethernet)            recv(socket, chunkBuffer, 1024)
+>                                            1KB transferred per SPI transaction
+>                                            → W5500 marks that 1KB as freed
+>                                            → TCP window opens again
+>                                            → server sends next 1KB of data
+>
+> Stage 3: chunkBuffer ───HAL_FLASH_Prog──▶ Flash Bank 2 (384KB)
+>          Flash write @ ~1ms per KB         HAL_FLASH_Program() burns 1KB
+>          (slowest stage — the bottleneck)   → loop repeats 384 times total
+>
+> Speed profile:
+>   Ethernet RX:  ~100 Mbps      ← fastest (rarely the bottleneck)
+>   SPI read:     ~20 Mbps       ← medium
+>   Flash write:  ~8 Mbps (~1KB/ms) ← SLOWEST — this governs the OTA speed
+>   Total OTA time: 384KB × ~1ms = ~400ms minimum (Flash limited)
+> ```
+>
+> **The TCP Sliding Window — why it never overflows:**
+>
+> TCP has a built-in flow control mechanism called the **Receive Window**. The W5500 hardware automatically advertises to the remote server how many bytes of free space exist in its RX buffer. When the STM32 reads 1KB via SPI and calls `recv()`, the W5500 automatically tells the server "I have 1KB of space again — send more." If the STM32 is busy writing to Flash and hasn't read from the RX buffer yet, the W5500 tells the server "window = 0 — stop sending." The server pauses without dropping data. This self-regulating mechanism makes it impossible for the W5500's RX buffer to overflow during a well-implemented OTA loop.
+>
+> **Summary of the answer:**
+> - ❌ NOT "download all 384KB to W5500 first" — physically impossible, W5500 only has 14KB for OTA socket
+> - ❌ NOT "strict 1KB at a time — download 1KB, pause, next 1KB" — the pipeline stages overlap
+> - ✅ **Continuous pipelined stream:** Server fills W5500 buffer at Ethernet speed → STM32 drains it via SPI → burns to Flash → TCP window opens → server sends more. At any given moment the W5500 holds up to ~14KB buffered ahead while the STM32 is burning the current 1KB to Flash.
+
 **2. Guaranteeing it fits at runtime:**
 Because we strictly partitioned the memory map using the `STM32F407VGTX_FLASH.ld` linker script, we have an absolute mathematical guarantee it fits.
 *   Bank 1 (The live FreeRTOS app) is 384KB. It is currently executing.
 *   Bank 2 (The empty download slot) is a physically separate 384KB block of silicon purely reserved for OTA.
 Because we only stream 1KB chunks at a time over SPI and burn them directly into the reserved 384KB of Bank 2, the memory footprint never overflows at runtime. Bank 1 is entirely untouched until the download finishes.
+
+
 
 
 
