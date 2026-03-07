@@ -539,24 +539,88 @@ Task_Ctrl (Priority: High)  ← THE MATH ENGINE
 
 **The decisive factor: DMA disqualification**
 
-`Task_Poll` would also benefit from CCM RAM since it's high priority. However, `Task_Poll` owns the `rx_buffer` — the global array where UART DMA physically writes incoming Modbus bytes. If we accidentally placed `rx_buffer` (or any DMA target) in CCM RAM, the DMA engine would silently write to an address it cannot reach over the AHB bus, the bytes would never arrive, and the system would hang waiting for a semaphore that never gets released.
+`Task_Poll` would also benefit from CCM RAM since it's high priority. However, `Task_Poll` owns the `rx_buffer` — the global array where UART DMA physically writes incoming Modbus bytes. If we placed `rx_buffer` in CCM RAM, the DMA engine would silently write to an address unreachable over the AHB bus, the bytes would never arrive, and the system would hang waiting for a semaphore that never gets released.
 
-`Task_Ctrl` has **no DMA buffers at all** — it only reads from a FreeRTOS queue (a pure CPU memory copy operation) and writes results via function calls. It is 100% safe to live in CCM RAM.
+> **❓ "Is it ONLY SRAM that DMA can access? Is CCM RAM the only exception?"**
+>
+> CCM RAM is not the only memory DMA can access — and SRAM is not the only memory it can reach. The rule is: **DMA can access anything connected to the AHB system bus. CCM RAM is the sole exception because it is wired exclusively to the CPU's private D-Bus.**
+>
+> **Full DMA access map for STM32F407:**
+>
+> | Memory | Address | DMA Access | Why |
+> |---|---|---|---|
+> | Normal SRAM | `0x20000000` | ✅ Yes | On AHB bus |
+> | Flash (read) | `0x08000000` | ✅ Yes (read-only) | On AHB bus via DCode |
+> | APB1/2 Peripherals | `0x40000000` | ✅ Yes | DMA's primary job |
+> | AHB Peripherals | `0x50000000` | ✅ Yes | Directly on AHB |
+> | **CCM RAM** | **`0x10000000`** | **❌ No** | **CPU D-Bus only, not AHB** |
+>
+> So DMA can also read from Flash (e.g., DMA memory-to-peripheral copy from a `const` lookup table). The constraint is purely about bus topology, not memory type:
+>
+> ```
+> STM32F407 Physical Bus Topology:
+>
+>             Cortex-M4 CPU
+>           ┌───────────────┐
+>           │  I-Bus  ──────┼──────────────────────▶ Flash (instruction fetch)
+>           │  D-Bus  ══════╪══════▶ CCM RAM        ← CPU ONLY, nothing else
+>           │  S-Bus  ──────┼──┐      0x10000000
+>           └───────────────┘  │
+>                              ▼
+>     ┌──────────────── AHB Bus Matrix ─────────────────────────┐
+>     │                                                          │
+>  Normal SRAM    Flash (read)   Peripherals   DMA1    DMA2     │
+>  0x20000000     0x08000000     0x40000000    Ctrl    Ctrl     │
+>  (DMA ✅)       (DMA ✅ read)  (DMA ✅)      (AHB master)    │
+>     ▲                                           │              │
+>     └───────────────────────────────────────────┘              │
+>              DMA moves data between anything here
+>
+>  CCM RAM at 0x10000000 has NO connection to the AHB bus above.
+>  DMA controllers are AHB masters — they cannot see 0x10000000.
+> ```
+>
+> **The silent failure danger — why this bug is invisible:**
+>
+> ```c
+> // ❌ WRONG — putting a DMA buffer in CCM RAM
+> __attribute__((section(".ccmram")))
+> uint8_t rx_buffer_BAD[256];        // placed at 0x10000000 (CCM)
+>
+> HAL_UART_Receive_DMA(&huart1, rx_buffer_BAD, 256);
+> // DMA starts transfer, writes 256 bytes to 0x10000000 address
+> // The AHB bus has no route to CCM → bytes written into electrical void
+> // rx_buffer_BAD remains all zeros (empty)
+> // DMA fires "transfer complete" interrupt anyway — no error flag raised!
+> // Task_Poll calls osSemaphoreAcquire(rxSem, 250ms)
+> // Semaphore never releases (ISR fires but data is wrong)
+> // System silently hangs, then 250ms timeout aborts — diagnosis is VERY hard
+>
+> // ✅ CORRECT — DMA buffer stays in normal SRAM
+> uint8_t rx_buffer[256];            // placed at 0x20000000 (normal SRAM)
+> HAL_UART_Receive_DMA(&huart1, rx_buffer, 256);  // DMA writes here ✅
+> ```
+>
+> The STM32 hardware **does not generate a bus fault or error** when DMA is pointed at CCM RAM. It completes the transfer to an unreachable address and raises the success interrupt as if everything worked. This makes CCM misuse one of the hardest bugs to diagnose on an STM32.
+
+`Task_Ctrl` has **no DMA buffers at all** — it only reads from a FreeRTOS queue (a pure CPU `memcpy` from SRAM to its own stack) and writes results via function calls. It is 100% safe to live in CCM RAM.
 
 **In summary:**
-- `Task_Poll` → Normal SRAM (must stay — its DMA rx_buffer is adjacent, DMA constraint)
-- `Task_Net` → Normal SRAM (sleeping 99% of the time, no benefit worth the complexity)
-- **`Task_Ctrl` → CCM RAM** (pure CPU math, no DMA, heaviest stack user = maximum benefit)
+- `Task_Poll` → Normal SRAM (DMA writes `rx_buffer` here — DMA constraint is hard)
+- `Task_Net` → Normal SRAM (sleeping 99% of the time, negligible stack activity)
+- **`Task_Ctrl` → CCM RAM** (pure CPU math, zero DMA interaction, heaviest stack user)
 
 #### Summary: CCM RAM Rules
 
 | Rule | Reason |
 |---|---|
-| ✅ Use for task stacks (CPU-only tasks) | 0 wait states on every stack access |
-| ✅ Use for math-heavy local buffers | Pure CPU access, no bus contention |
-| ❌ Never use for DMA rx/tx buffers | DMA cannot reach CCM RAM — wrong bus |
-| ❌ Never use for W5500 SPI `chunkBuffer` | SPI DMA writes to it — would silently fail |
-| ❌ Never use for Modbus `rx_buffer` | UART DMA writes to it — would miss all data |
+| ✅ Use for CPU-only task stacks | 0 wait states — private CPU bus |
+| ✅ Use for math-heavy local variables | No bus contention during float computation |
+| ✅ DMA CAN access normal SRAM | SRAM is on the AHB bus |
+| ✅ DMA CAN read Flash too | Flash is on the AHB bus via DCode |
+| ❌ Never use CCM for any DMA buffer | CCM is not on the AHB bus — silent data loss |
+| ❌ Never use CCM for `rx_buffer` | UART DMA writes via AHB → CCM unreachable |
+| ❌ Never use CCM for `chunkBuffer` | SPI DMA writes via AHB → CCM unreachable |
 
 
 
