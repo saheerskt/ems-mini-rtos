@@ -22,6 +22,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "FreeRTOS.h"
+#include "task.h"
 #include "modbus_rtu.h"
 #include "bms_can.h"
 #include "mqtt_ota.h"
@@ -65,9 +67,17 @@ const osThreadAttr_t netTask_attributes = {
 
 /* Definitions for Task_Ctrl */
 osThreadId_t ctrlTaskHandle;
+
+// CCM RAM Acceleration: Map the heavy decision brain stack natively to the fast zero-wait-state bus!
+__attribute__((section(".ccmram"))) uint32_t ctrlTaskStack[512];
+__attribute__((section(".ccmram"))) StaticTask_t ctrlTaskControlBlock;
+
 const osThreadAttr_t ctrlTask_attributes = {
   .name = "Task_Ctrl",
-  .stack_size = 512 * 4,
+  .cb_mem = &ctrlTaskControlBlock,
+  .cb_size = sizeof(ctrlTaskControlBlock),
+  .stack_mem = &ctrlTaskStack[0],
+  .stack_size = sizeof(ctrlTaskStack),
   .priority = (osPriority_t) osPriorityHigh,
 };
 

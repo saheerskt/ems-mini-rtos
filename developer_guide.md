@@ -297,6 +297,22 @@ block-beta
   Bank2["0x080A 0000<br>Download SLOT 1<br>(New Firmware holding zone)"]
 ```
 
+### 5.0 The Network Download Process: Will it fit in memory?
+A critical operations question is: *How exactly do we download the binary, and how do we guarantee it fits in the hardware at runtime?*
+
+**1. The Download Method:**
+The firmware is downloaded via a standard HTTP/TCP socket. However, because the STM32 has very little RAM, we **do not** download the entire file into RAM.
+*   The remote CI/CD Server transmits the TCP/IP packets.
+*   The packets hit the **WIZnet W5500** ethernet chip. The W5500 has internal silicon buffers.
+*   The STM32's `Task_Net` uses the **SPI Bus** to slowly stream 1 Kilobyte chunks out of the W5500 and into a tiny temporary RAM `chunkBuffer`.
+*   The STM32 instantly writes that 1KB chunk directly into the physical Flash memory of Bank 2 using `HAL_FLASH_Program()`. 
+
+**2. Guaranteeing it fits at runtime:**
+Because we strictly partitioned the memory map using the `STM32F407VGTX_FLASH.ld` linker script, we have an absolute mathematical guarantee it fits. 
+*   Bank 1 (The live FreeRTOS app) is 384KB. It is currently executing.
+*   Bank 2 (The empty download slot) is a physically separate 384KB block of silicon purely reserved for OTA.
+Because we only stream 1KB chunks at a time over SPI and burn them directly into the reserved 384KB of Bank 2, the memory footprint never overflows at runtime. Bank 1 is entirely untouched until the download finishes.
+
 ### The OTA Execution Flow
 
 ### 5.1 Is Secure Boot Required? Did We Integrate It?
@@ -382,9 +398,11 @@ If a forklift unplugs the board exactly while MCUboot is swapping chunks, MCUboo
 
 **What happens if the newly updated active partition is corrupted or crashes?**
 We implemented an **"Image Confirmation"** fail-safe mechanism:
-*   After MCUboot swaps Bank 2 into Bank 1, it expects the new FreeRTOS Application to boot up successfully, connect to the cloud, and eventually call a specific C API: `boot_set_confirmed()`.
-*   If the new firmware contains a fatal bug (e.g., a Hard Fault) and the CPU crashes *before* it can call `boot_set_confirmed()`, the hardware Independent Watchdog (IWDG) will automatically reset the CPU. 
-*   MCUboot wakes up, checks the flags, realizes the new firmware failed to confirm itself, and instantly **REVERTS** the swap, pulling the old, stable firmware back out of Bank 2 and into Bank 1!
+*   After MCUboot swaps Bank 2 into Bank 1, it passes the boot sequence to the new application. 
+*   The new FreeRTOS application must successfully initialize, connect to the Cloud, and eventually call a specific C API: `boot_set_confirmed()`.
+*   If the new firmware contains a fatal bug (e.g., a Hard Fault, or it was larger than 384KB and overwrote itself), the CPU will crash *before* it can ever call `boot_set_confirmed()`.
+*   The hardware **Independent Watchdog (IWDG)** will detect the freeze and automatically reset the CPU. 
+*   MCUboot wakes up, checks the flags, realizes the new firmware failed to confirm itself, and instantly **REVERTS** the swap, pulling the old, stable firmware out of the Scratch area and back into Bank 1!
 
 ---
 
