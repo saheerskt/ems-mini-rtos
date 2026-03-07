@@ -29,22 +29,49 @@ void NET_Init(void) {
     // reg_wizchip_spi_cbfunc(wizchip_spi_readbyte, wizchip_spi_writebyte);
     // reg_wizchip_cs_cbfunc(wizchip_cs_select, wizchip_cs_deselect);
 
-    // 3. Obtain IP via DHCP or Static Settings (Placeholder)
-    // DHCP_init(0, dhcp_buffer);
-    // DHCP_run();
+    // 3. Obtain IP via DHCP (Dynamic Host Configuration Protocol)
+    // The W5500 itself only handles stateless UDP packets. The STM32 MUST 
+    // run the IP management state-machine logic (Discover, Offer, Request, ACK).
+    /*
+    uint8_t dhcp_buffer[1024];
+    DHCP_init(0, dhcp_buffer);
+    */
 }
 
 /**
  * @brief FreeRTOS Task body simulating connection to MQTT Cloud.
  */
 void NET_Process_MQTT(const SystemState_t *globalStatePtr) {
-    // 1. Establish TCP Socket to MQTT_BROKER_IP
-    // int sockStatus = connect(1, brokerIP, MQTT_BROKER_PORT);
+    // 1. Establish Stateful TCP Socket to MQTT_BROKER_IP
+    // Unlike LwIP, the W5500 hardware physically manages the 3-Way Handshake, sliding windows, 
+    // and packet retransmissions natively in silicon. The STM32 just waits for "Established".
+    // int sockStatus = connect(MQTT_SOCKET_NUM, brokerIP, MQTT_BROKER_PORT);
     
-    // 2. We are online!
+    // 2. We are online! Track the last heartbeat/telemetry timestamp
     uint32_t lastPublishTime = osKernelGetTickCount();
     
     while(1) {
+        // --- 0. PHYSICAL ETHERNET LINK SURVIVAL CHECK --- //
+        /*
+        // If someone physically unplugs the RJ45 cable, the PHY status goes down.
+        if (wizphy_getphylink() == PHY_LINK_OFF) {
+            // Unplug detected! Fail gracefully.
+            close(MQTT_SOCKET_NUM); // Reset the stateful hardware TCP engine
+            
+            // Sleep lazily instead of crashing. 
+            // When the cable is replugged, the while(1) loop resumes natively!
+            osDelay(1000); 
+            continue;
+        }
+        
+        // --- 0.1 DHCP LEASE RENEWAL --- //
+        // If plugged in but our lease expired, the STM32 must automatically ask the router for a new IP.
+        if (DHCP_run() != DHCP_IP_LEASED) {
+             osDelay(500);
+             continue; // Yield and keep trying until the router responds.
+        }
+        */
+
         // --- 1. HANDLE INBOUND DOWNLINK DE-QUEUEING (SUBSCRIBE) --- //
         // Example: The W5500 TCP stack receives a packet triggering an internal RX ISR.
         // The MQTT parser yields `{"cmd":"limit", "val": 4000}`.
