@@ -379,7 +379,28 @@ While we utilized the core pillars of FreeRTOS, there are specific features we a
 
 From a corporate team perspective, architecting a bare-metal RTOS from scratch requires extreme discipline. We built this step-by-step:
 
-1. **Phase 1: Architecture & Hardware Selection:** The systems team defined the I/O requirements (CAN, RS-485, SPI, Ethernet). We selected the STM32F407 due to its mature HAL, FPU, and multiple DMA streams.
+```mermaid
+flowchart TD
+    classDef req fill:#8c1b11,stroke:#e63946,stroke-width:2px,color:#fff
+    classDef hw fill:#1e1e1e,stroke:#00a3cc,stroke-width:2px,color:#fff
+    classDef fw fill:#0f5e2d,stroke:#3ea662,stroke-width:2px,color:#fff
+    classDef rtos fill:#0b3b60,stroke:#333,stroke-width:2px,color:#fff
+    classDef ci fill:#462873,stroke:#a06cd5,stroke-width:2px,color:#fff
+
+    A["Phase 0<br>Requirements & Spec"]:::req --> B["Phase 1<br>Architecture & Silicon Matching"]:::hw
+    B --> C["Phase 2<br>Bare-Metal Driver Validation"]:::fw
+    C --> D["Phase 3<br>RTOS Integration & Mapping"]:::rtos
+    D --> E["Phase 4<br>Datapath & IPC Design"]:::rtos
+    E --> F["Phase 5<br>Bootloader & OTA Security"]:::fw
+    F --> G["Phase 6<br>Logic, Tuning & CI/CD"]:::ci
+
+    click A "Requirements: Real-Time Safety, Sub-$35 BOM"
+    click B "Hardware: STM32F407 (FPU, 1MB Flash, DMA)"
+    click C "Validation: W5500 SPI & CAN without FreeRTOS"
+```
+
+0. **Phase 0: Requirements Gathering & System Specification:** Before writing a single line of C code, product owners gathered the physical and financial constraints. The system needed strict deterministic safety to prevent physical grid overloads (nanosecond response times required), had to handle highly-noisy electrical environments, support secure OTA updates, interface with RS-485/CAN natively, and completely fit within a Sub-$35 Bill of Materials. Embedded Linux was ruled out due to cost, and the "RTOS + Microcontroller" directive became the foundational requirement constraint.
+1. **Phase 1: Architecture & Hardware Selection:** The systems team mapped the software specifications to physical silicon. We selected the STM32F407 due to its mature HAL, FPU (to instantly crunch solar peak shaving math), massive 1MB internal flash (for dual-bank security), and multiple simultaneous DMA streams.
 2. **Phase 2: Bare-Metal Driver Validation:** Before ever activating FreeRTOS, the firmware team wrote standalone, isolated drivers. We proved the W5500 SPI chip could ping a cloud server, and we proved the CAN mailbox could read raw battery data without OS overhead.
 3. **Phase 3: RTOS Integration & Task Mapping:** We introduced FreeRTOS and rigidly defined the 3-Task Topology (`Poll`, `Ctrl`, `Net`). We mapped the prior standalone drivers into these isolated thread spaces.
 4. **Phase 4: Datapath & IPC Design:** We defined the exact structure of `SystemState_t` and `CloudCommand_t`, routed them through FreeRTOS Queues, and instituted a "Zero Global Variable" policy.
