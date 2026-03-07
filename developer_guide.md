@@ -325,6 +325,29 @@ On a bare-metal STM32, there is **no filesystem abstraction layer**. The interna
 *   **Erasing a sector:** A reversed high voltage sweeps all trapped electrons off the floating gates of an **entire sector at once** (e.g., 16KB or 128KB). This is why erasing takes **10 to 50 milliseconds** — thousands of transistors must be simultaneously discharged — and physically locks the entire ARM data bus during the operation.
 *   **Non-volatility:** The electrons remain trapped on the floating gate for **10 to 100 years** with zero power applied. This is why Flash memory retains firmware across power cycles.
 
+> **❓ "Is this floating-gate array a separate chip, or part of the STM32?"**
+>
+> It is **built directly into the STM32F407 die itself**. There is no external Flash chip. The STM32F407VGT6 is a **System-on-Chip**: a single 10mm × 10mm silicon package that contains the Cortex-M4 CPU, DMA controllers, all peripherals (UART, SPI, CAN), **1MB of Flash**, and 192KB of SRAM — all fabricated together on one piece of silicon.
+>
+> ```
+> STM32F407VGT6 — Single Silicon Die (~49mm²)
+> ┌──────────────────────────────────────────────────────┐
+> │  ┌─────────────┐   ┌─────────────────────────────┐  │
+> │  │ Cortex-M4   │   │ 1MB Internal Flash           │  │
+> │  │ CPU + FPU   │   │ (8,388,608 floating-gate     │  │
+> │  │ @ 168MHz    │   │  transistors in a grid)      │  │
+> │  └─────────────┘   └─────────────────────────────┘  │
+> │  ┌─────────────┐   ┌─────────────────────────────┐  │
+> │  │ 192KB SRAM  │   │ Peripherals: UART, SPI, CAN  │  │
+> │  │ + 64KB CCM  │   │ DMA, Timers, ADC, I2C...    │  │
+> │  └─────────────┘   └─────────────────────────────┘  │
+> └──────────────────────────────────────────────────────┘
+>              All on ONE physical IC package.
+>              No external Flash chip required.
+> ```
+>
+> The 1MB of Flash is not a "storage medium" like an SD card or eMMC. It is a fixed region of silicon transistors that is part of the CPU package itself, addressed directly by the ARM core at addresses `0x08000000` to `0x080FFFFF`. When you call `HAL_FLASH_Program(address, data)`, you are directly commanding the on-die Flash Controller to apply voltage pulses to specific transistors inside the same package the CPU lives in.
+
 ### The Flash Partition Architecture
 The STM32F407 has 1 MB (1024 KB) of internal Flash memory. We logically partitioned this into four distinct blocks to support a primary bootloader (MCUboot) and a resilient dual-bank fallback mechanism.
 
@@ -348,17 +371,43 @@ block-beta
 A critical operations question is: *How exactly do we download the binary, and how do we guarantee it fits in the hardware at runtime?*
 
 **1. The Download Method:**
-The firmware is downloaded via a standard HTTP/TCP socket. However, because the STM32 has very little RAM, we **do not** download the entire file into RAM.
+The firmware is downloaded via a standard HTTP/TCP socket. We **write the binary directly into Flash** — but in **1KB chunks**, not all at once.
+
+> **❓ "Why 1KB chunks? Why not download the whole binary first, then flash it?"**
+>
+> Because **RAM is smaller than the binary**. The STM32F407 has only **128KB of total SRAM**. The incoming firmware binary can be up to **384KB**. You cannot fit 384KB into 128KB — it is a physical impossibility.
+>
+> The 1KB chunk streaming pattern is the only viable solution:
+>
+> ```
+>  RAM (128KB total)          Flash Bank 2 (384KB)
+>  ┌────────────────┐         ┌──────────────────────────────────┐
+>  │                │         │ Chunk 1   (already burned)       │
+>  │ chunkBuffer    │──────▶  │ Chunk 2   (already burned)       │
+>  │ [1024 bytes]   │  HAL_   │ Chunk 3   ← being written NOW   │
+>  │                │  FLASH_ │ Chunk 4   (still 0xFF, empty)   │
+>  │ Only 1KB used  │  Prog() │ ...                              │
+>  │ at any time!   │         │ Chunk 384 (still 0xFF, empty)   │
+>  └────────────────┘         └──────────────────────────────────┘
+>
+>  Loop: Read 1KB from W5500 SPI → Burn to Flash → Read next 1KB → Repeat
+>  At no point does more than 1KB of the binary exist in RAM simultaneously.
+> ```
+>
+> The binary IS written directly to Flash transistors — we just do it 1KB at a time, in order, as each chunk arrives over SPI from the W5500 buffer. This is functionally identical to "direct Flash write" — just pipelined through a tiny RAM staging buffer.
+
 *   The remote CI/CD Server transmits the TCP/IP packets.
 *   The packets hit the **WIZnet W5500** ethernet chip. The W5500 has internal silicon buffers.
 *   The STM32's `Task_Net` uses the **SPI Bus** to slowly stream 1 Kilobyte chunks out of the W5500 and into a tiny temporary RAM `chunkBuffer`.
-*   The STM32 instantly writes that 1KB chunk directly into the physical Flash memory of Bank 2 using `HAL_FLASH_Program()`. 
+*   The STM32 instantly writes that 1KB chunk directly into the physical Flash memory of Bank 2 using `HAL_FLASH_Program()`.
 
 **2. Guaranteeing it fits at runtime:**
-Because we strictly partitioned the memory map using the `STM32F407VGTX_FLASH.ld` linker script, we have an absolute mathematical guarantee it fits. 
+Because we strictly partitioned the memory map using the `STM32F407VGTX_FLASH.ld` linker script, we have an absolute mathematical guarantee it fits.
 *   Bank 1 (The live FreeRTOS app) is 384KB. It is currently executing.
 *   Bank 2 (The empty download slot) is a physically separate 384KB block of silicon purely reserved for OTA.
 Because we only stream 1KB chunks at a time over SPI and burn them directly into the reserved 384KB of Bank 2, the memory footprint never overflows at runtime. Bank 1 is entirely untouched until the download finishes.
+
+
 
 ### The OTA Execution Flow
 
