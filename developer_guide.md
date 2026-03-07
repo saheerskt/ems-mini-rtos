@@ -404,6 +404,124 @@ On a bare-metal STM32, there is **no filesystem abstraction layer**. The interna
 >
 > This is why on a Linux system you have an eMMC (Flash equivalent) AND DDR RAM (SRAM equivalent as separate chips). On the STM32, both are baked into the same die — just much smaller.
 
+---
+
+### What is CCM RAM and Why Does Task_Ctrl Live There?
+
+**CCM = Core Coupled Memory.** It is a special 64KB SRAM block on the STM32F407 that is wired differently from normal SRAM.
+
+#### The Bus Architecture Problem
+
+Every peripheral on the STM32 is connected through a central **AHB System Bus Matrix** — an on-chip crossbar switch that lets the Cortex-M4 CPU, all DMA streams, and all peripherals communicate. The problem is this bus is **shared**. When the CPU wants to read data from normal SRAM at `0x20000000`, it enters the bus, waits for any pending DMA transfers or peripheral accesses to finish, then gets its data. This takes **1 to 3 extra clock cycles** per access — called "wait states."
+
+```
+Normal SRAM Access Path (shared bus):
+────────────────────────────────────────────────────────
+
+   Cortex-M4 CPU                         SRAM
+   ┌───────────┐                     ┌──────────┐
+   │  I-Bus    │──────────────────▶  │          │
+   │  (instr.) │                     │  Normal  │
+   │           │    AHB System       │  SRAM    │
+   │  D-Bus    │──▶ Bus Matrix ────▶ │ 0x20000000│
+   │  (data)   │  ┌────────────┐     │          │
+   └───────────┘  │ DMA Ctrl 1 │──▶  │          │
+                  │ DMA Ctrl 2 │──▶  │          │
+                  │ Peripherals│──▶  │          │
+                  └────────────┘     └──────────┘
+                  ↑ All compete here — CPU may wait 1-3 cycles
+
+CCM RAM Access Path (dedicated private wire):
+────────────────────────────────────────────────────────
+
+   Cortex-M4 CPU                         CCM RAM
+   ┌───────────┐                     ┌──────────────┐
+   │  D-Bus    │═════════════════▶   │  CCM RAM     │
+   │  (data)   │  Private direct     │  0x10000000  │
+   └───────────┘  wire — no matrix   │  64KB        │
+                  no waiting!        └──────────────┘
+                  ↑ CPU always gets 0 wait states here
+                  ⚠ DMA CANNOT access CCM RAM — wrong bus!
+```
+
+#### Why CCM RAM Cannot Be Used for DMA Buffers
+
+This is a critical hardware constraint. DMA controllers are connected to the **AHB system bus**, not the CPU's private D-Bus. CCM RAM is literally not electrically connected to the AHB bus. Therefore:
+- ✅ CCM RAM is **perfect for Task stacks, local variables, math buffers** — anything the CPU reads/writes directly
+- ❌ CCM RAM **cannot be used for** `rx_buffer` (Modbus DMA target), `chunkBuffer` (SPI DMA), or any buffer that hardware DMA writes to
+
+This is exactly why our `rx_buffer` for Modbus DMA stays in normal SRAM at `0x20000000`, while `Task_Ctrl`'s stack moves to CCM RAM.
+
+#### How We Move Task_Ctrl's Stack Into CCM RAM (3 Steps)
+
+**Step 1 — The Linker Script defines the CCM RAM region:**
+```c
+// STM32F407VGTX_FLASH.ld
+MEMORY {
+    CCMRAM (xrw) : ORIGIN = 0x10000000, LENGTH = 64K   // ← CCM region declared
+    RAM    (xrw) : ORIGIN = 0x20000000, LENGTH = 128K
+    FLASH  (rx)  : ORIGIN = 0x08040000, LENGTH = 384K
+}
+
+SECTIONS {
+    .ccmram :                          // ← Section maps to CCM address
+    {
+        *(.ccmram)
+        *(.ccmram*)
+    } > CCMRAM AT > FLASH             // Initialised from Flash at boot
+}
+```
+
+**Step 2 — GCC attribute forces the stack array into `.ccmram` section:**
+```c
+// main.c — Task_Ctrl stack and control block placed in CCM RAM
+__attribute__((section(".ccmram"))) uint32_t ctrlTaskStack[512];
+__attribute__((section(".ccmram"))) StaticTask_t ctrlTaskControlBlock;
+```
+The `__attribute__((section(".ccmram")))` GCC directive tells the linker: *"Put this variable in the `.ccmram` section"* — which the linker script maps to `0x10000000`. Without this, GCC would place the array in normal `.bss` (SRAM at `0x20000000`) by default.
+
+**Step 3 — FreeRTOS task creation uses the CCM pointers:**
+```c
+// main.c — osThreadAttr_t points FreeRTOS directly to CCM RAM
+const osThreadAttr_t ctrlTask_attributes = {
+    .name      = "Task_Ctrl",
+    .cb_mem    = &ctrlTaskControlBlock,     // TCB lives in CCM RAM
+    .cb_size   = sizeof(ctrlTaskControlBlock),
+    .stack_mem = &ctrlTaskStack[0],         // Stack lives in CCM RAM
+    .stack_size= sizeof(ctrlTaskStack),     // 512 × 4 = 2048 bytes
+    .priority  = (osPriority_t) osPriorityHigh,
+};
+// FreeRTOS will use our CCM buffers instead of allocating from SRAM heap
+ctrlTaskHandle = osThreadNew(StartCtrlTask, NULL, &ctrlTask_attributes);
+```
+
+#### Why This Matters for Task_Ctrl Specifically
+
+`Task_Ctrl` runs the **Peak-Shaving algorithm** — the heaviest mathematical loop in the system. On every cycle it reads grid power, battery SOC, evaluates charge/discharge decisions, and computes inverter setpoints using floating-point arithmetic. Every local variable in this function (`float surplus`, `int32_t gridDelta`, etc.) lives on the stack.
+
+With the stack in **normal SRAM**: each local variable read/write pays 1–3 AHB bus wait states at 168MHz.
+
+```
+Normal SRAM at 168MHz:
+  1 wait state = 1 / 168,000,000 = ~5.95 nanoseconds per wasted cycle
+  A peak-shaving loop with 50 stack operations = ~300ns overhead per call
+  Running every 300ms = negligible... BUT during burst loads it matters
+```
+
+With the stack in **CCM RAM**: every stack access is 0 wait states — the CPU reads its local variables at full 168MHz throughput with no stalls. The algorithm runs measurably faster with no hardware cost.
+
+#### Summary: CCM RAM Rules
+
+| Rule | Reason |
+|---|---|
+| ✅ Use for task stacks | CPU reads/writes stack with 0 wait states |
+| ✅ Use for math-heavy local buffers | Pure CPU access, no bus contention |
+| ❌ Never use for DMA rx/tx buffers | DMA cannot reach CCM RAM — wrong bus |
+| ❌ Never use for W5500 SPI `chunkBuffer` | SPI DMA writes to it — would silently fail |
+| ❌ Never use for Modbus `rx_buffer` | UART DMA writes to it — would miss all data |
+
+
+
 
 
 ### The Flash Partition Architecture
