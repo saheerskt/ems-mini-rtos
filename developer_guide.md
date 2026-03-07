@@ -495,30 +495,69 @@ const osThreadAttr_t ctrlTask_attributes = {
 ctrlTaskHandle = osThreadNew(StartCtrlTask, NULL, &ctrlTask_attributes);
 ```
 
-#### Why This Matters for Task_Ctrl Specifically
+#### Why Task_Ctrl and NOT Task_Poll or Task_Net?
 
-`Task_Ctrl` runs the **Peak-Shaving algorithm** — the heaviest mathematical loop in the system. On every cycle it reads grid power, battery SOC, evaluates charge/discharge decisions, and computes inverter setpoints using floating-point arithmetic. Every local variable in this function (`float surplus`, `int32_t gridDelta`, etc.) lives on the stack.
+This is the right question. CCM RAM is 64KB — we could theoretically put all three task stacks there. But only `Task_Ctrl` genuinely benefits. Here's why, by comparing what each task actually does during one cycle:
 
-With the stack in **normal SRAM**: each local variable read/write pays 1–3 AHB bus wait states at 168MHz.
+**What does each task spend its time doing?**
+
+| | `Task_Poll` | `Task_Net` | `Task_Ctrl` |
+|---|---|---|---|
+| **Primary activity** | Firing DMA, then **sleeping** | Waiting for SPI/TCP, then **sleeping** | **Actively computing** math |
+| **CPU-bound work** | Minimal — parse ~10 Modbus bytes | Minimal — `snprintf()` for JSON | **Heavy** — float peak-shaving loop |
+| **Stack access pattern** | Brief burst, then 300ms blocked | Brief burst, then 5s blocked | Continuous, no sleeping during compute |
+| **Local variables on stack** | A few ints, a frame pointer | String buffer pointers, packet length | `float surplus`, `int32_t delta`, `uint16_t setpoint`... many floats |
+| **Where it waits** | `osSemaphoreAcquire()` — blocked | `osDelay(5000)` — blocked | `osMessageQueueGet()` — briefly, then computes |
+| **DMA interaction** | YES — DMA writes to its `rx_buffer` | YES — SPI DMA reads `chunkBuffer` | **NO** — pure CPU math, no DMA |
 
 ```
-Normal SRAM at 168MHz:
-  1 wait state = 1 / 168,000,000 = ~5.95 nanoseconds per wasted cycle
-  A peak-shaving loop with 50 stack operations = ~300ns overhead per call
-  Running every 300ms = negligible... BUT during burst loads it matters
+Timeline of each task in one 300ms window:
+
+Task_Poll (Priority: Realtime)
+─────────────────────────────────────────────────────────────────▶ time
+[fire DMA] [sleep ~290ms waiting for UART response] [parse] [fire DMA again]
+     └─ only brief CPU bursts, 95% of time BLOCKED
+        Stack accessed very rarely → CCM benefit = tiny
+
+Task_Net (Priority: Normal)
+─────────────────────────────────────────────────────────────────▶ time
+[snprintf JSON] [SPI write to W5500] [sleep 5000ms] ...
+     └─ mostly sleeping, occasional short string ops
+        Stack rarely warm → CCM benefit = negligible
+
+Task_Ctrl (Priority: High)  ← THE MATH ENGINE
+─────────────────────────────────────────────────────────────────▶ time
+[Queue wait] ──▶ [READ: gridPowerW, soc, maxChg, maxDis]
+               ──▶ [COMPUTE: float surplus = maxDis - gridPowerW]
+               ──▶ [COMPUTE: clamp(setpoint, MIN, MAX)]
+               ──▶ [COMPUTE: PID damping, ramp limits]
+               ──▶ [WRITE: inverter Modbus register]
+               ──▶ [Queue wait again]
+     └─ CONTINUOUS CPU work the entire time it is running
+        Stack accessed on EVERY instruction → CCM benefit = REAL
 ```
 
-With the stack in **CCM RAM**: every stack access is 0 wait states — the CPU reads its local variables at full 168MHz throughput with no stalls. The algorithm runs measurably faster with no hardware cost.
+**The decisive factor: DMA disqualification**
+
+`Task_Poll` would also benefit from CCM RAM since it's high priority. However, `Task_Poll` owns the `rx_buffer` — the global array where UART DMA physically writes incoming Modbus bytes. If we accidentally placed `rx_buffer` (or any DMA target) in CCM RAM, the DMA engine would silently write to an address it cannot reach over the AHB bus, the bytes would never arrive, and the system would hang waiting for a semaphore that never gets released.
+
+`Task_Ctrl` has **no DMA buffers at all** — it only reads from a FreeRTOS queue (a pure CPU memory copy operation) and writes results via function calls. It is 100% safe to live in CCM RAM.
+
+**In summary:**
+- `Task_Poll` → Normal SRAM (must stay — its DMA rx_buffer is adjacent, DMA constraint)
+- `Task_Net` → Normal SRAM (sleeping 99% of the time, no benefit worth the complexity)
+- **`Task_Ctrl` → CCM RAM** (pure CPU math, no DMA, heaviest stack user = maximum benefit)
 
 #### Summary: CCM RAM Rules
 
 | Rule | Reason |
 |---|---|
-| ✅ Use for task stacks | CPU reads/writes stack with 0 wait states |
+| ✅ Use for task stacks (CPU-only tasks) | 0 wait states on every stack access |
 | ✅ Use for math-heavy local buffers | Pure CPU access, no bus contention |
 | ❌ Never use for DMA rx/tx buffers | DMA cannot reach CCM RAM — wrong bus |
 | ❌ Never use for W5500 SPI `chunkBuffer` | SPI DMA writes to it — would silently fail |
 | ❌ Never use for Modbus `rx_buffer` | UART DMA writes to it — would miss all data |
+
 
 
 
