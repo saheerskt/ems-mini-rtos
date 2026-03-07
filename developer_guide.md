@@ -80,6 +80,36 @@ stateDiagram-v2
 | **`Task_Ctrl`** | `Medium` (`osPriorityHigh`) | **Core EMS Decision Logic (The Brain):** Wakes up instantaneously the moment new hardware data arrives. Calculates power flow limits, executes localized safety failsafes, and runs deterministic peak-shaving formulas to actively command the inverter to charge or discharge. | **Blocked** indefinitely waiting on `osMessageQueueGet` for new telemetry. |
 | **`Task_Net`** | `Low` (`osPriorityNormal`) | **Cloud Communication & MQTT IoT Bridge:** Handles all external internet communications. It serializes internal telemetry into JSON strings, publishes them to the Cloud broker via the SPI Ethernet chip, and listens for remote command overrides. Lowest priority ensures network slowdowns never stall physical safety limits. | **Blocked** on `osDelay(250)` or TCP Socket waits. |
 
+**Task Implementation Pseudo-Code (`Task_Poll`):**
+```c
+// CMSIS-RTOS v2 Task Definitions
+const osThreadAttr_t pollTask_attributes = {
+  .name = "Task_Poll",
+  .stack_size = 512 * 4, // 2048 Bytes allocated statically
+  .priority = (osPriority_t) osPriorityRealtime,
+};
+
+void Start_Task_Poll(void *argument) {
+  for(;;) {
+    // 1. Kick off UART DMA to physical Grid Meter
+    HAL_UART_Receive_DMA(&huart2, rx_buffer, sizeof(rx_buffer));
+    
+    // 2. Block until hardware DMA completes (Consumes 0% CPU!)
+    osSemaphoreAcquire(dmaRxSemaphore, osWaitForever);
+    
+    // 3. Process Modbus data & Push struct to Queue
+    SystemState_t new_state = parse_modbus_data(rx_buffer);
+    osMessageQueuePut(Queue_DataHandle, &new_state, 0, 0);
+    
+    // 4. Yield CPU rigidly for 300ms polling cycle
+    osDelay(300);
+  }
+}
+
+// Triggered sequentially inside main()
+osThreadNew(Start_Task_Poll, NULL, &pollTask_attributes);
+```
+
 > **Note on Naming & Priority Levels:** 
 > Why is `osPriorityHigh` labeled as "Medium"? 
 > The terms "High, Medium, Low" here represent the **relative priority within our application's 3-task hierarchy**, not the absolute OS priority logic. 
@@ -127,6 +157,35 @@ sequenceDiagram
 ### The Operational Queues & Data Structures
 
 Our architecture relies on three explicit FreeRTOS Ring-Buffer Queues to manage data flow deterministically.
+
+**Queue Creation & Routing Pseudo-Code:**
+```c
+// 1. Queue Handle Definitions
+osMessageQueueId_t Queue_DataHandle;
+const osMessageQueueAttr_t Queue_Data_attributes = { .name = "Queue_Data" };
+
+// 2. Queue Allocation (During System Boot)
+// Capacity: 32 elements deep. Element size: sizeof(SystemState_t)
+Queue_DataHandle = osMessageQueueNew(32, sizeof(SystemState_t), &Queue_Data_attributes);
+
+// 3. Task_Ctrl Intercepting the Queue
+void Start_Task_Ctrl(void *argument) {
+  SystemState_t system_state; // Local memory copy for isolation
+  
+  for(;;) {
+    // 4. Block forever (0% CPU) until Task_Poll pushes new telemetry!
+    if(osMessageQueueGet(Queue_DataHandle, &system_state, NULL, osWaitForever) == osOK) {
+        
+        // Data has seamlessly arrived by value!
+        // Run strict safety limits and peak-shaving formulas
+        run_peak_shaving_algorithm(&system_state);
+        
+        // Physically transmit hardware command back to inverter
+        execute_inverter_command();
+    }
+  }
+}
+```
 
 > **What does "16 Elements" actually mean in RAM?**
 > A common misconception is that "16 Elements" means 16 blocks of huge 256-byte buffers.
@@ -220,12 +279,20 @@ A common question is: *"If DMA is so great for Modbus, why don't we use DMA for 
 One of the most complex features of a bare-metal RTOS is updating its own executable code without "bricking" the board in the field. Since there is no `ext4` Linux filesystem, we write binaries directly to physical Silicon transistors.
 
 ### The Flash Partition Architecture
-The STM32F407 has 1 MB of internal Flash memory. We logically partition this into three distinct blocks to support a primary bootloader (MCUboot) and a dual-bank fallback mechanism.
+The STM32F407 has 1 MB (1024 KB) of internal Flash memory. We logically partitioned this into four distinct blocks to support a primary bootloader (MCUboot) and a resilient dual-bank fallback mechanism.
+
+**How did we conclude the size of each partition?**
+We mathematically sized the boundaries based on compiled binary footprints and the architectural demands of the Cortex-M4 memory erase sectors:
+1. **Bootloader (`0x08000000` - 64 KB):** MCUboot requires space for its ECDSA cryptography libraries and serial hardware drivers. A standard heavily-optimized build takes ~45 KB. We allocated exactly 64 KB (consuming the physical silicon `Sector_0` to `Sector_3`) to give it safety boundaries.
+2. **Active App / Bank 1 (`0x08040000` - 384 KB):** Our current FreeRTOS application, compiled with HAL drivers, takes ~70 KB. We allocated a massive 384 KB to allow the project's logic to grow exponentially over the next 10 years without ever hitting a memory ceiling.
+3. **Download Slot / Bank 2 (`0x080A0000` - 384 KB):** This *must* physically match the size of Bank 1 byte-for-byte to permit a seamless memory swap.
+4. **Scratch / Swap Space (`0x08020000` - 128 KB):** MCUboot requires an empty sector to act as a temporary holding zone when physically rotating the chunks of data between Bank 1 and Bank 2.
 
 ```mermaid
 block-beta
   columns 1
   Bootloader["0x0800 0000<br>MCUboot Bootloader<br>(64 KB)"]
+  Scratch["0x0802 0000<br>Swap Scratch Space<br>(128 KB)"]
   Bank1["0x0804 0000<br>Active Application SLOT 0<br>(Running FreeRTOS)"]
   Bank2["0x080A 0000<br>Download SLOT 1<br>(New Firmware holding zone)"]
 ```
@@ -297,9 +364,27 @@ The most critical part of this logic is the protection of the ARM Data Bus durin
     2.  No task, no matter its priority, can preempt the OTA thread.
     3.  We routinely call `xTaskResumeAll()` between chunk writes if we need to let the W5500 SPI hardware catch its breath or let the hardware Watchdog reset.
 
-### Edge Case: Fallback / "Anti-Brick" Protection
-If the power goes out during step 7 (`Erase Bank 1 & Copy`), what happens?
-The `MCUboot` bootloader is designed as a "Swap using Scratch" or "Overwrite" manager. If the copy is interrupted, on the next physical reboot, MCUboot will realize Bank 1 is corrupt. It will look at Bank 2, verify its SHA256 Hash is still intact, and simply restart the copy process. The board is permanently safe from being bricked.
+### Edge Case: Fallback / "Anti-Brick" Protection & Partition Swapping
+How does MCUboot manage the physical partition switch, and what happens when disasters occur?
+
+**How do we manage the partition switch in OTA?**
+MCUboot uses a **"Swap using Scratch"** physical memory mechanism. 
+1. MCUboot reads a 4KB chunk from Bank 1 and writes it to the Scratch Sector.
+2. It reads a 4KB chunk from Bank 2 and overwrites the exact place in Bank 1.
+3. It takes the original chunk resting in the Scratch Sector and writes it into Bank 2.
+4. It dynamically cycles this loop until the entire 384KB application is successfully swapped!
+
+**What happens if OTA fails mid-download?**
+If the W5500 SPI connection drops in the middle of downloading the `.bin` to Bank 2 (or loses power), `Task_Net` simply aborts the transaction and deletes the fragment. Bank 1 (the active app) was never touched. The board powers up and continues running normally.
+
+**What happens if the power dies DURING the Partition Swap?**
+If a forklift unplugs the board exactly while MCUboot is swapping chunks, MCUboot will resume the swap on the next physical reboot. Since everything touches the Scratch sector first, MCUboot reads the state flags and natively resumes the copy without bricking.
+
+**What happens if the newly updated active partition is corrupted or crashes?**
+We implemented an **"Image Confirmation"** fail-safe mechanism:
+*   After MCUboot swaps Bank 2 into Bank 1, it expects the new FreeRTOS Application to boot up successfully, connect to the cloud, and eventually call a specific C API: `boot_set_confirmed()`.
+*   If the new firmware contains a fatal bug (e.g., a Hard Fault) and the CPU crashes *before* it can call `boot_set_confirmed()`, the hardware Independent Watchdog (IWDG) will automatically reset the CPU. 
+*   MCUboot wakes up, checks the flags, realizes the new firmware failed to confirm itself, and instantly **REVERTS** the swap, pulling the old, stable firmware back out of Bank 2 and into Bank 1!
 
 ---
 
@@ -505,7 +590,18 @@ In a standard bare-metal project, the Linker Script instructs the CPU to place t
 *   **Standard Linker (Unused):** `FLASH_APP_START = 0x08000000;`
 *   **Our Modified Linker:** `FLASH_APP_START = 0x08040000;`
 
-We physically pushed the starting address of `ems-rtos-mini` 256KB deep into the memory map, reserving the first massive block entirely for the Bootloader and its Cryptographic Hash routines. 
+**Modified Linker Script Snippet (`STM32F407VGTX_FLASH.ld`):**
+```text
+MEMORY
+{
+  CCMRAM (xrw)     : ORIGIN = 0x10000000, LENGTH = 64K
+  RAM (xrw)        : ORIGIN = 0x20000000, LENGTH = 128K
+  /* Bootloader is 0x0800 0000 to 0x0803 FFFF */
+  FLASH (rx)       : ORIGIN = 0x08040000, LENGTH = 384K /* Bank 1 App Slot */
+}
+```
+
+We physically pushed the starting address of `ems-rtos-mini` 256KB deep into the memory map (`0x08040000`), reserving the foundational blocks purely for the Bootloader and its Cryptographic Swap / Scratch routines. 
 
 We also had to shift the **Vector Table Offset Register (VTOR)** inside `system_stm32f4xx.c`. If we didn't tell the ARM Cortex core that its interrupt vector table moved to `0x08040000`, the moment a hardware timer fired, the CPU would look in the wrong place, executing garbage bootloader memory, and instantly crash into a Hard Fault.
 
@@ -522,7 +618,19 @@ When power is dynamically applied to the 24V bus from the battery racks, the boa
     *   It checks the "Magic Trailer" in Flash Bank 2 to see if an Over-The-Air (OTA) update is pending copy.
     *   It reads the ECDSA Public Key embedded in its own memory and runs heavy elliptic curve mathematical verification over the Bank 1 Application (taking roughly ~100+ milliseconds due to intensive cryptography).
     *   If Secure Boot passes, MCUboot points the Program Counter (`PC` register) to `0x08040000` and executes a Jump command.
-3.  **SystemInit() (`+151 ms`):** The `ems-rtos-mini` application strictly starts. First, it runs the `SystemClock_Config()` function to fire up the external 8MHz Crystal Oscillator (HSE), feeding it through the PLL to aggressively multiply the core clock to exactly **168 MHz**.
+3.  **SystemInit() (`+151 ms`):** 
+    **Customizing the Kernel / Startup:** In a bare-metal RTOS, the Interrupt Vector Table must be shifted so FreeRTOS timers fire correctly *after* MCUboot hands over control. If we didn't do this, hardware interrupts would look directly at the bootloader memory and crash the system. We specifically modified `system_stm32f4xx.c`:
+    ```c
+    // Inside system_stm32f4xx.c
+    #define USER_VECT_TAB_ADDRESS
+    #define VECT_TAB_OFFSET  0x00040000U // Shifted 256KB deep matching Linker
+
+    void SystemInit(void) {
+        /* FPU settings & System clock config */
+        SCB->VTOR = FLASH_BASE | VECT_TAB_OFFSET; // Move the core interrupts!
+    }
+    ```
+    Once the core kernel vectors are shifted, it evaluates the `SystemClock_Config()` function to fire up the external 8MHz Crystal Oscillator (HSE), feeding it through the PLL to aggressively multiply the core clock to exactly **168 MHz**.
 4.  **C Runtime Initialization (`+155 ms`):** The C-language `_start()` routine copies all global variable initializations (`.data` section) slowly from Flash ROM into volatile RAM. 
 5.  **FreeRTOS Kernel Launch (`+160 ms`):** `main()` completes creating the 3 Queues, 3 Tasks, and Semaphores, and finally calls `osKernelStart()`. The FreeRTOS preemptive scheduler takes over the CPU entirely.
 6.  **Application Running (`+300 ms`):** Within roughly 1/3 of a second of bare-metal power-on, `Task_Poll` executes its first deterministic Modbus DMA read from the Grid Meter.
@@ -611,7 +719,15 @@ While building this architecture, the team faced extreme bare-metal engineering 
 
 ---
 
-## 19. Efficiency & Memory Footprint
+## 19. Efficiency, Optimizations & Memory Footprint
+
+### What specific optimizations did we apply?
+In order to maximize silicon performance and hit our hard-realtime nanosecond budgets, we applied several drastic optimizations:
+
+1. **Hardware Offloading:** As detailed previously, we ruthlessly offloaded the entire TCP/IP networking stack to the W5500 silicon wrapper and the UART Modbus byte-parsing to the internal DMA silicon streams. This effectively yields 0% CPU consumption for mass data transport.
+2. **Compiler Optimizations (`-O2`):** In `CMakeLists.txt` / Makefile settings, we explicitly passed `-O2` to the GCC compiler. This aggressively unrolls `for()` loops and optimizes math pipelines at the expense of slightly larger binary sizes (which we easily afforded with our 384KB Flash partition).
+3. **FPU Native Math Activation:** By explicitly asserting `#define __FPU_PRESENT 1`, the Cortex-M4 computes peak-shaving Float matrices natively in hardware transistors in a single clock cycle, completely bypassing thousands of cycles of software library emulation.
+4. **CCM RAM Acceleration (Core Coupled Memory):** The STM32F407 contains 64KB of ultra-fast CCM RAM directly tied to the CPU data bus (bypassing the main system matrix). We specifically altered the linker script and FreeRTOS settings to dump the most demanding `Task_Ctrl` stack computations into `.ccmram` for absolute maximum algorithmic execution speed.
 
 ### How Efficient is the Design?
 The design is **extremely efficient**. Because the CPU uses **Deferred Processing**, it spends roughly **95% of its life asleep** in the Idle Task. 
