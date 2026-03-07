@@ -346,7 +346,65 @@ On a bare-metal STM32, there is **no filesystem abstraction layer**. The interna
 >              No external Flash chip required.
 > ```
 >
-> The 1MB of Flash is not a "storage medium" like an SD card or eMMC. It is a fixed region of silicon transistors that is part of the CPU package itself, addressed directly by the ARM core at addresses `0x08000000` to `0x080FFFFF`. When you call `HAL_FLASH_Program(address, data)`, you are directly commanding the on-die Flash Controller to apply voltage pulses to specific transistors inside the same package the CPU lives in.
+> **Flash vs SRAM — What is each one used for?**
+>
+> These are two completely different types of silicon memory with opposite properties:
+>
+> | Property | Flash (1MB) | SRAM (192KB + 64KB CCM) |
+> |---|---|---|
+> | **Cell type** | Floating-gate transistor | Standard 6-transistor SRAM cell |
+> | **Volatile?** | ❌ Non-volatile — survives power-off | ✅ Volatile — contents lost instantly on power-off |
+> | **Write speed** | Very slow (~ms per sector erase) | Extremely fast (single CPU cycle) |
+> | **What lives here** | The firmware binary (code + constants) | Everything that runs at runtime |
+> | **Analogy** | Your hard drive / eMMC | Your RAM / DDR |
+>
+> **What exactly is in each region at runtime in this project?**
+>
+> ```
+> FLASH (1MB) — Non-volatile, survives power-off         @ 0x08000000
+> ┌─────────────────────────────────────────────────┐
+> │ MCUboot binary + embedded ECDSA public key      │ ← Bootloader code
+> │ Scratch swap space (empty, used by MCUboot)     │
+> │ FreeRTOS app: compiled machine code             │ ← CPU fetches instructions here
+> │   ├─ Task function code (StartPollTask etc.)    │
+> │   ├─ HAL driver machine code                    │
+> │   ├─ const lookup tables, string literals       │
+> │   └─ Initial values of global variables (.data) │
+> │ Bank 2: OTA download slot (empty until OTA)     │
+> └─────────────────────────────────────────────────┘
+>
+> SRAM (192KB) — Volatile, wiped on every power-off      @ 0x20000000
+> ┌─────────────────────────────────────────────────┐
+> │ .data section: initialized global variables      │ ← Copied from Flash at boot
+> │   e.g. int retryCount = 0;                      │
+> │ .bss section: zero-initialized globals          │ ← Zeroed by _start()
+> │   e.g. SystemState_t globalState;               │
+> │ FreeRTOS Heap: Queues, Semaphore control blocks │
+> │   ├─ Queue_Data ring buffer (32 × SystemState_t)│
+> │   ├─ Queue_Cmd ring buffer  (16 × CloudCmd_t)   │
+> │   └─ queueCanRxHandle ring buffer               │
+> │ Task Stacks (each task gets its own SRAM stack) │
+> │   ├─ Task_Poll stack (512 × 4 = 2KB)            │
+> │   ├─ Task_Net  stack (512 × 4 = 2KB)            │
+> │   └─ Task_Ctrl stack → CCM RAM (see below)      │
+> │ chunkBuffer[1024]: OTA 1KB staging buffer        │ ← Temporary, overwritten each chunk
+> │ mqttPayloadBuffer: JSON telemetry string buffer  │
+> │ rx_buffer: incoming Modbus DMA landing zone      │
+> └─────────────────────────────────────────────────┘
+>
+> CCM RAM (64KB) — Zero-wait-state, CPU bus direct       @ 0x10000000
+> ┌─────────────────────────────────────────────────┐
+> │ Task_Ctrl stack (peak-shaving algorithm)        │ ← Fastest possible execution
+> │   __attribute__((section(".ccmram")))           │
+> │   uint32_t ctrlTaskStack[512];                  │
+> └─────────────────────────────────────────────────┘
+> ```
+>
+> **The key insight:** The CPU fetches its instructions from **Flash** on every clock cycle (the compiled machine code never moves — it lives there permanently). But every variable, every queue, every task stack, every runtime value — all of that **only exists in SRAM**. SRAM is completely blank after every power cycle. The C runtime `_start()` function re-populates it from the `.data` section in Flash at every boot before `main()` runs.
+>
+> This is why on a Linux system you have an eMMC (Flash equivalent) AND DDR RAM (SRAM equivalent as separate chips). On the STM32, both are baked into the same die — just much smaller.
+
+
 
 ### The Flash Partition Architecture
 The STM32F407 has 1 MB (1024 KB) of internal Flash memory. We logically partitioned this into four distinct blocks to support a primary bootloader (MCUboot) and a resilient dual-bank fallback mechanism.
