@@ -472,7 +472,104 @@ SECTIONS {
 }
 ```
 
+> **❓ "How do we decide 64K, 128K, 384K? Can we change these sizes?"**
+>
+> **You do not decide them. They are fixed, immutable physical properties of the STM32F407VGT6 silicon die**, documented in ST's Reference Manual (RM0090). The `MEMORY {}` block is not a configuration — it is a *description of what physically exists on the chip*. Writing wrong values does not reconfigure the hardware; it causes HardFaults when your code tries to access addresses with no transistors behind them.
+>
+> **Origins and sizes come directly from the STM32F407 datasheet:**
+>
+> | Region | `ORIGIN` | `LENGTH` | Fixed by silicon? |
+> |---|---|---|---|
+> | CCM RAM | `0x10000000` | **64KB** — exactly 65,536 CCM transistor cells | ✅ Yes — cannot change |
+> | SRAM1   | `0x20000000` | 112KB on-die (part of the 128K total) | ✅ Yes |
+> | SRAM2   | `0x2001C000` | 16KB on-die (linker merges with SRAM1 as 128K) | ✅ Yes |
+> | Flash   | `0x08000000` | **1024KB** physical total | ✅ Yes |
+>
+> **What we changed vs left alone:**
+> ```
+> DEFAULT (from STM32CubeMX):          OUR VERSION (MCUboot offset added):
+> FLASH  : ORIGIN = 0x08000000,        FLASH  : ORIGIN = 0x08040000,  ← CHANGED
+>           LENGTH = 1024K                       LENGTH = 384K         ← CHANGED
+> RAM    : ORIGIN = 0x20000000,        RAM    : ORIGIN = 0x20000000,  ← UNCHANGED
+>           LENGTH = 128K                        LENGTH = 128K         ← UNCHANGED
+> CCMRAM : ORIGIN = 0x10000000,        CCMRAM : ORIGIN = 0x10000000,  ← UNCHANGED
+>           LENGTH = 64K                         LENGTH = 64K          ← UNCHANGED
+> ```
+> Only the Flash window was shifted to reserve the first 256KB for MCUboot. The RAM and CCM values are copied verbatim from the datasheet and must never be changed.
+>
+> **What happens if you lie to the linker:**
+> ```c
+> // ❌ WRONG — CCM RAM on this chip is only 64KB
+> CCMRAM (xrw) : ORIGIN = 0x10000000, LENGTH = 128K
+> // Linker places data at 0x10010000 (beyond real CCM end: 0x1000FFFF)
+> // CPU reads from 0x10010000 at runtime → no transistors there → BusFault → HardFault
+> ```
+>
+> **CCM size differs across STM32 variants:**
+> ```
+> STM32F407VGT6 (this project) → CCM = 64KB  @ 0x10000000
+> STM32F103C8   (Blue Pill)    → CCM = NONE  (this chip has no CCM at all!)
+> STM32F767ZI                  → CCM = NONE  (replaced by DTCM 128KB @ 0x20000000)
+> STM32H743ZI                  → ITCM = 64KB + DTCM = 128KB (different architecture)
+> ```
+> This is one of the reasons the STM32F407 was chosen over cheaper alternatives like the STM32F103 — the dedicated 64KB CCM RAM is a free hardware performance bonus unavailable on smaller variants.
+
+---
+
+### When Do You Actually Need to Edit the Linker Script?
+
+In a **basic bare-metal project** (no bootloader, no special memory placement), the STM32CubeMX-generated linker script works perfectly and you should never touch it. However, there are well-defined real-world situations that require edits. Here are all of them:
+
+#### Situations in a General STM32 Project
+
+| Situation | What You Change | Why |
+|---|---|---|
+| **Adding a bootloader (MCUboot, custom)** | `FLASH ORIGIN` + `LENGTH` | Shift app start address to leave room for bootloader at front of Flash |
+| **Placing code in CCM / fast RAM** | Add `.ccmram` section in `SECTIONS {}` | CCM is not mapped by default — you must define the section manually |
+| **Adding external SPI Flash (QSPI/XIP)** | Add `QSPI_FLASH` region to `MEMORY {}` | External Flash at a different base address (e.g., `0x90000000` for QSPI) |
+| **Adding external SRAM via FMC bus** | Add `EXT_RAM` region to `MEMORY {}` | External SDRAM/SRAM chip connected via FMC at `0x60000000+` |
+| **Reserving persistent config / NVS area** | Add `NVDATA` region at last Flash sector | Store device settings at a fixed Flash address that OTA never erases |
+| **Shared memory between bootloader & app** | Add `SHARED_RAM` at a specific SRAM address with `NOLOAD` | Pass boot reason flags or crash logs between boot stages without zero-init |
+| **Placing ISR handlers in CCM for speed** | Add custom section + GCC attribute | Critical ISRs execute from 0-wait-state CCM instead of Flash (avoids Flash wait states during execution) |
+| **Stack / heap size enforcement** | Modify `_Min_Stack_Size` and `_Min_Heap_Size` symbols | Ensure the linker errors at build time if your code would overflow |
+| **Firmware metadata / version struct** | Reserve fixed address for a `FW_INFO` struct | Allows a programmer tool to read firmware version without parsing full ELF |
+| **Backup SRAM (survives reset / low power)** | Add `BKPSRAM` region at `0x40024000` | 4KB battery-backed SRAM on STM32F4 that survives system reset and standby |
+
+#### The Two Modifications We Made in This Project
+
+**Modification 1 — Flash window shift for MCUboot:**
+```
+Before:  FLASH : ORIGIN = 0x08000000, LENGTH = 1024K  ← full 1MB, app owns everything
+After:   FLASH : ORIGIN = 0x08040000, LENGTH = 384K   ← app starts 256KB in, MCUboot owns front
+```
+Required because MCUboot must live at `0x08000000` (the ARM reset vector address). Without this, both MCUboot and the app would try to link to the same addresses and corrupt each other.
+
+**Modification 2 — Adding the `.ccmram` section for Task_Ctrl:**
+```c
+// Added to SECTIONS {} in STM32F407VGTX_FLASH.ld:
+.ccmram :
+{
+    . = ALIGN(4);
+    _sccmram = .;
+    *(.ccmram)
+    *(.ccmram*)
+    . = ALIGN(4);
+    _eccmram = .;
+} >CCMRAM AT> FLASH
+```
+Required because the CCM RAM region exists in hardware but has no default section in the linker script. Without this addition, `__attribute__((section(".ccmram")))` in C code would produce a linker error: `"no memory region specified for section '.ccmram'"`.
+
+#### Things You Should NEVER Change
+
+| Field | Why Not |
+|---|---|
+| `ORIGIN` of `RAM` / `CCMRAM` | Fixed silicon addresses from datasheet |
+| `LENGTH` of `RAM` / `CCMRAM` | Fixed silicon sizes — lying causes runtime HardFaults |
+| The `.isr_vector` section placement | Must be at the start of the Flash region (VTOR base) |
+| The `.data` and `.bss` section structure | C runtime `_start()` depends on the `_sdata`, `_edata` symbols these generate |
+
 **Step 2 — GCC attribute forces the stack array into `.ccmram` section:**
+
 ```c
 // main.c — Task_Ctrl stack and control block placed in CCM RAM
 __attribute__((section(".ccmram"))) uint32_t ctrlTaskStack[512];
@@ -622,12 +719,113 @@ Task_Ctrl (Priority: High)  ← THE MATH ENGINE
 | ❌ Never use CCM for `rx_buffer` | UART DMA writes via AHB → CCM unreachable |
 | ❌ Never use CCM for `chunkBuffer` | SPI DMA writes via AHB → CCM unreachable |
 
+---
 
+### The Full Memory Hierarchy: Where Does the CPU Actually "Think"?
 
+When we say "CCM RAM is for CPU activities" — the CPU still needs memory to do its work. This reveals a **third level** of memory that sits above SRAM and CCM: **CPU Registers** — the actual working space of the processor.
 
+#### Level 1: CPU Registers — Where Math Actually Happens
 
+The Cortex-M4 has physical registers etched **inside the CPU core silicon itself** — not at any memory address, not in SRAM, not in Flash. They are microscopic flip-flop circuits inside the processor die, accessible in a single clock cycle (~0.006ns at 168MHz):
+
+```
+Cortex-M4 Internal Registers (inside CPU core, no RAM address):
+┌────────────────────────────────────────────────────────────────┐
+│  General Purpose:  R0   R1   R2   R3   R4   R5   R6   R7      │
+│                    R8   R9   R10  R11  R12                     │
+│                                                                │
+│  Special Purpose:  R13 = SP  (Stack Pointer → points to SRAM) │
+│                    R14 = LR  (Link Register — return address)  │
+│                    R15 = PC  (Program Counter → points to Flash│
+│                    xPSR      (Flags: Zero, Carry, Negative...) │
+│                                                                │
+│  FPU Registers:    S0  S1  S2  ... S31   (32 × float32)       │
+│                    D0  D1  D2  ... D15   (16 × float64)        │
+│                    FPSCR                 (FPU status/control)  │
+└────────────────────────────────────────────────────────────────┘
+              These are physical silicon flip-flops.
+              They have no address. They are not SRAM.
+              There are only ~50 of them total.
+```
+
+#### What Actually Happens When Task_Ctrl Runs a Math Line
+
+Take this line from the peak-shaving algorithm:
+```c
+float surplus = maxDischargePower - gridPowerW;
+```
+
+The CPU **never directly subtracts from SRAM**. Every operation flows through registers:
+
+```
+Step ①  VLDR  S0, [SP, #8]       ; SP points to Task_Ctrl stack in CCM RAM
+                                  ; Load 'maxDischargePower' → FPU register S0
+
+Step ②  VLDR  S1, [SP, #4]       ; Load 'gridPowerW' from CCM stack → S1
+
+Step ③  VSUB.F32  S2, S0, S1     ; FPU subtracts: S2 = S0 - S1
+                                  ; THIS happens inside the FPU silicon — no memory touched
+
+Step ④  VSTR  S2, [SP, #0]       ; Store result from S2 → CCM RAM (surplus variable)
+
+         CCM RAM ─load─▶ FPU Reg ─compute─▶ FPU Reg ─store─▶ CCM RAM
+                    (Step 1,2)    (Step 3)              (Step 4)
+```
+
+**The subtraction (Step 3) is purely inside the FPU — zero memory access.** CCM RAM is only touched in the load and store steps, which is why 0 wait states there directly speeds up the algorithm.
+
+#### The Complete 3-Level Memory Hierarchy in This Project
+
+```
+Level    Memory             Size    Addr          Speed       Persistent?   What lives here
+───────────────────────────────────────────────────────────────────────────────────────────
+  1    CPU Registers         ~50    (no address)  0.006ns    ❌ Volatile   Active computation
+       (R0-R15, S0-S31)     values  inside core   1 cycle    (wiped on    Math in-progress
+                                                              ctx switch)  Return addresses
+
+  2a   CCM RAM              64KB    0x10000000     ~6ns       ❌ Volatile   Task_Ctrl stack
+       (Core Coupled)               CPU D-Bus      0 wait                  Local float vars
+                                    only           states
+
+  2b   Normal SRAM         192KB    0x20000000     ~6-24ns    ❌ Volatile   FreeRTOS Queues
+                                    AHB bus        1-3 wait                Task stacks (Poll, Net)
+                                                   states                  DMA rx/tx buffers
+
+  3    Flash               1MB      0x08000000     ~6ns+      ✅ Permanent  Compiled machine code
+       (internal)                   AHB/ICode      erase ms   forever     MCUboot bootloader
+                                                                          const lookup tables
+```
+
+#### The Context Switch — Why Stack Speed Matters for the Scheduler
+
+One more reason CCM RAM speeds up the system beyond just Task_Ctrl's math: **FreeRTOS context switches.**
+
+Every time a higher-priority task preempts Task_Ctrl, the scheduler must:
+
+```
+Context Switch OUT (Task_Ctrl → Task_Poll):
+─────────────────────────────────────────────────────────────────
+① CPU auto-saves: R0-R3, R12, LR, PC, xPSR → Task_Ctrl stack   ← HARDWARE (automatic)
+② FreeRTOS saves: R4-R11, S0-S31, FPSCR → Task_Ctrl stack      ← SOFTWARE (task.c)
+   (All 32 FPU registers must be saved because Task_Ctrl uses floats!)
+③ Stack Pointer updated to Task_Poll's saved SP (in SRAM)
+
+Context Switch IN (Task_Poll resumes):
+─────────────────────────────────────────────────────────────────
+① FreeRTOS restores: R4-R11 from Task_Poll's stack (in SRAM)
+② CPU auto-restores: R0-R3, LR, PC, xPSR from Task_Poll's stack
+③ Task_Poll resumes at exact instruction it was interrupted at
+```
+
+When Task_Ctrl's stack is in **CCM RAM**: saving and restoring 32 FPU registers + 13 general registers = 45 × 4 bytes = 180 bytes of stack writes/reads happen at **0 wait states**.
+
+When in **normal SRAM**: those same 180 bytes cost **1–3 wait states each** on the shared AHB bus — directly adding latency to every preemption event in the system.
+
+Since the FreeRTOS scheduler runs up to **1000 times per second** (every 1ms SysTick), this compound saving is measurable in a profiler like SEGGER SystemView.
 
 ### The Flash Partition Architecture
+
 The STM32F407 has 1 MB (1024 KB) of internal Flash memory. We logically partitioned this into four distinct blocks to support a primary bootloader (MCUboot) and a resilient dual-bank fallback mechanism.
 
 **How did we conclude the size of each partition?**
