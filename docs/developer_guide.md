@@ -34,6 +34,7 @@
 23. [Interview Practice Question Bank](#23-interview-practice-question-bank)
 24. [Answer Reference Sheet](#24-answer-reference-sheet)
 25. [Commercial Toolchain & Licensing](#25-commercial-toolchain--licensing)
+26. [Glossary of Terms & Abbreviations](#26-glossary-of-terms--abbreviations)
 
 ---
 
@@ -3440,25 +3441,69 @@ For a production-grade industrial deployment, it is critical to move beyond "eva
 
 ### 🛠️ Software & Middleware Licenses
 
-| Component | License Type | Commercial Cost | Notes |
-| :--- | :--- | :--- | :--- |
-| **FreeRTOS V10.3.1** | **MIT** | **$0 (Free)** | Fully permissive. No royalties or per-unit costs to Amazon. |
-| **CMSIS-RTOS v2** | **Apache 2.0** | **$0 (Free)** | ARM-standard abstraction, open-source and free for commercial use. |
-| **STM32CubeIDE / MX** | **ST SLA** | **$0 (Free)** | Free to use as long as the target silicon is an ST product. |
-| **ARM GNU Toolchain** | **GPL / BSD** | **$0 (Free)** | The standard `arm-none-eabi-gcc` suite is open-source. |
-| **SEGGER SystemView** | **Commercial (CUL)** | **~$1,880 USD** | Required for commercial revenue. License is typically locked to the J-Link probe SN. |
-| **SEGGER Ozone** | **Proprietary** | **Included** | High-end debugger included with J-Link Plus/Ultra+/Pro probes. |
-| **MCUboot** | **Apache 2.0** | **$0 (Free)** | Flexible bootloader, free for commercial IoT. |
-| **WIZnet ioLib_Driver**| **BSD** | **$0 (Free)** | Free for use with WIZnet hardware (W5500). |
+| Component | Version (Project Start) | License Type | Commercial Cost | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **FreeRTOS Kernel** | **V10.3.1** | MIT | $0 (Free) | Fully permissive. No royalties. |
+| **CMSIS-RTOS API** | **v2.1.3** | Apache 2.0 | $0 (Free) | ARM-standard abstraction. |
+| **STM32CubeIDE** | **v1.17.0** | ST SLA | $0 (Free) | Commercial use allowed for ST Silicon. |
+| **ARM GNU Toolchain** | **14.2.Rel1** | GPL / BSD | $0 (Free) | `arm-none-eabi-gcc` suite. |
+| **SEGGER SystemView** | **v3.58** | Commercial (CUL) | ~$1,880 USD | Required for commercial revenue. |
+| **SEGGER Ozone** | **v3.36** | Proprietary | Included | Bundled with J-Link Plus/Ultra+. |
+| **MCUboot** | **v2.1.0** | Apache 2.0 | $0 (Free) | Secure bootloader for commercial IoT. |
+| **WIZnet ioLib_Driver**| **v4.0.0** | BSD | $0 (Free) | For W5500 hardware support. |
 
 ### 🔌 Hardware Debugging & Logic Analysis
 
-| Device | Model | Est. Price | Commercial Rationale |
+| Device | Model / Software Version | Est. Price | Commercial Rationale |
 | :--- | :--- | :--- | :--- |
-| **SEGGER J-Link** | **Base / Plus** | **$400 - $650** | Industrial standard for speed and stability. The "Plus" model includes many software licenses (Ozone, J-Flash). |
-| **Saleae Logic** | **Logic Pro 8** | **~$999** | Essential for protocol timing verification (Modbus/CAN). Software is free; hardware is the license. |
-| **ST-LINK/V2** | **V2-ISOL** | **~$120** | Cheap alternative for factory flashing, but slower for real-time RTOS trace. |
+| **SEGGER J-Link** | **v8.12 (Driver Suite)** | $400 - $650 | Plus model includes Ozone & J-Flash licenses. |
+| **Saleae Logic** | **v2.4.14 (Logic 2)** | ~$999 | Essential for timing-critical bus validation. |
+| **ST-LINK/V2** | **V2-ISOL** | ~$120 | Galvanic isolation for safer factory flashing. |
 
 ### 💰 Total "Project Startup" Tooling Cost: **~$3,500 - $4,000**
 This is a one-time engineering investment (Capex) that allows a team to move from prototype to industrial-grade production with legal safety and high-speed debugging performance.
+
+---
+
+## 26. Glossary of Terms & Abbreviations
+
+To ensure clarity for all stakeholders, the following technical terms used throughout this guide are expanded and defined below.
+
+| Term | Expanded Form | Description |
+| :--- | :--- | :--- |
+| **AHB** | Advanced High-performance Bus | High-speed internal bus connecting the CPU core to RAM and DMA. |
+| **APB** | Advanced Peripheral Bus | Lower-speed bus for peripherals like UART, I2C, and CAN. |
+| **API** | Application Programming Interface | A set of commands/functions used to interact with a software layer (e.g. CMSIS-RTOS). |
+| **BMS** | Battery Management System | The electronic system that manages a rechargeable battery. |
+| **BOM** | Bill of Materials | A comprehensive list of raw materials and components needed to build the product. |
+| **CAN** | Controller Area Network | A robust vehicle bus standard designed to allow microcontrollers to communicate. |
+| **CCM RAM** | Core Coupled Memory RAM | Zero-wait-state memory tightly coupled to the CPU for maximum performance. |
+| **CMSIS** | Cortex Microcontroller Software Interface Standard | A vendor-independent hardware abstraction layer for ARM Cortex-M. |
+| **CRC** | Cyclic Redundancy Check | An error-detecting code used to verify data integrity. |
+| **DE** | Driver Enable | A control pin used in RS-485 to switch between transmit and receive modes. |
+| **DMA** | Direct Memory Access | A hardware feature allowing peripherals to move data without involving the CPU. |
+| **ECDSA** | Elliptic Curve Digital Signature Algorithm | A cryptographic algorithm used for signing and verifying firmware images. |
+| **EMS** | Energy Management System | The overall system responsible for balancing power flow between grid, solar, and battery. |
+| **FPU** | Floating Point Unit | A dedicated hardware co-processor for performing math on decimal numbers. |
+| **HAL** | Hardware Abstraction Layer | A software layer that hides hardware complexity behind standard C functions. |
+| **HSE** | High Speed External | A high-accuracy external crystal oscillator (8 MHz in this project). |
+| **HSI** | High Speed Internal | A built-in, less accurate RC oscillator used as a fail-safe. |
+| **IPC** | Inter-Task Communication | Mechanisms (like Queues or Semaphores) used for threads to talk to each other. |
+| **ISR** | Interrupt Service Routine | A special function that runs immediately in response to a hardware event. |
+| **ITM** | Instrumentation Trace Macrocell | A lightweight trace component for high-speed debug logging via SWO. |
+| **IWDG** | Independent Watchdog | A hardware safety timer that resets the CPU if the software freezes. |
+| **JSON** | JavaScript Object Notation | A lightweight data-interchange format used for Cloud telemetry. |
+| **MQTT** | Message Queuing Telemetry Transport | A lightweight IoT messaging protocol used for Cloud communication. |
+| **NVIC** | Nested Vectored Interrupt Controller | The internal ARM component that manages all hardware interrupt priorities. |
+| **OTA** | Over-The-Air | The process of updating firmware remotely via a network connection. |
+| **PGN** | Parameter Group Number | A 18-bit identifier used in the J1939 CAN protocol to group data. |
+| **PLL** | Phase-Locked Loop | A circuit used to multiply a low-frequency crystal up to high speeds (168 MHz). |
+| **RTOS** | Real-Time Operating System | An OS designed to provide deterministic response times to events. |
+| **SPI** | Serial Peripheral Interface | A high-speed synchronous serial bus used to talk to the W5500 Ethernet chip. |
+| **SWD** | Serial Wire Debug | A 2-pin interface used for flashing and debugging ARM microcontrollers. |
+| **SWO** | Serial Wire Output | An auxiliary trace pin used by the ITM to output high-speed debug data. |
+| **TCB** | Task Control Block | The internal FreeRTOS data structure that stores a task's unique state. |
+| **UART / USART** | Universal (Synchronous) Asynchronous Receiver Transmitter | Standard serial communication protocol used for RS-485 Modbus. |
+| **VTOR** | Vector Table Offset Register | A register that tells the CPU where to find the interrupt handlers in memory. |
+| **WFI** | Wait For Interrupt | An ARM instruction that puts the CPU into a low-power sleep until an event occurs. |
 
