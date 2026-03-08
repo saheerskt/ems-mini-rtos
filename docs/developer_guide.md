@@ -3639,12 +3639,23 @@ Ensuring that a failure in non-critical code (Like MQTT) cannot steal CPU time f
 *   **Next Level**: Use the STM32's **MPU (Memory Protection Unit)** to "jail" the Network Task, so a buffer overflow in the TCP/IP stack cannot physically overwrite the control task's variables.
 
 #### Step 3: Reliable Software Development (MISRA-C)
-Moving away from "standard" C and into "Safety-First" C.
-*   **Action**: Audit the codebase against **MISRA-C:2012** guidelines.
-*   **Key Rules**:
-    *   **Zero Dynamic Allocation**: Banning `malloc()`/`free()` (which we already do via static FreeRTOS objects).
-    *   **No Recursion**: Banning functions that call themselves to prevent stack overflow.
-    *   **Explicit Typing**: Using `uint32_t` instead of `int`.
+Moving away from "standard" C and into "Safety-First" C. **MISRA-C:2012** is the "Gold Standard" for high-reliability programming in the automotive and industrial sectors. If aiming for **IEC 62061 SIL-2** certification, MISRA-C is effectively mandatory.
+
+**The "Speciality" of MISRA-C:**
+C is powerful but allows "Undefined Behavior" that varies by compiler. MISRA-C bans the dangerous parts of C to ensure absolute reliability:
+*   **Bans Dynamic Memory (`malloc`)**: Prevents heap fragmentation and memory leaks that could crash the EMS after months of 24/7 operation.
+*   **Bans "Magic Numbers"**: Forces the use of named constants (e.g. `#define BATT_MAX_VOLTAGE 54.0f`) for auditability.
+*   **Bans Pointers to Pointers**: Drastically reduces the risk of complex buffer overflows or memory corruption.
+*   **Forces Explicit Types**: Requires the use of `stdint.h` (e.g. `uint32_t`) instead of generic `int` to ensure bit-width consistency across compilers.
+
+**Current Project Status:**
+Our project follows the **"Spirit of MISRA"** by using static FreeRTOS allocation, no heap usage, and explicit types. However, full **"Enforcement"** (the tools and audit trails) is the next required step for certification.
+
+**How to Add/Enable MISRA Enforcement:**
+1.  **Compiler Flags**: In the STM32 build settings, add `-Wall -Wextra -Wpedantic`. This catches ~20% of common violations. Adding `-Werror` transforms these warnings into build-stoppers.
+2.  **Static Analysis (Cppcheck)**: Running `cppcheck --addon=misra.json` provides an automated audit of the source code against the rulebook.
+3.  **STM32CubeIDE Integration**: Utilize the IDE's built-in static analysis tools (based on PC-lint/Cppcheck) to flag violations during the development phase.
+4.  **MISRA Compliance Matrix**: Maintain a document mapping every rule to its compliance status (Compliant, Deviated, or Not Applicable) for the final IEC 62061 audit.
 
 #### Step 4: Redundancy & Diagnostic Coverage
 We cannot rely on a single sensor or bit of data.
