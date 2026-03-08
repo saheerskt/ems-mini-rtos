@@ -995,7 +995,17 @@ sequenceDiagram
 1. **The Factory Signing:** During compilation, the CI/CD pipeline runs `imgtool` with our offline private key to cryptographically append an ECDSA signature to the binary.
 2. **The Trigger:** `Task_Net` receives the `{"cmd":"ota"}` MQTT packet indicating a new firmware binary is ready.
 3. **RTOS Halt:** `Task_Net` invokes `vTaskSuspendAll()`, explicitly denying the FreeRTOS Scheduler the right to context switch. The system is temporarily operating in a critical single-threaded state.
+   ```c
+   // Freeze FreeRTOS context switching
+   vTaskSuspendAll(); 
+   ```
 4. **Partition Erasure:** The CPU sends a command to the Flash Controller to erase **Bank 2**.
+   ```c
+   FLASH_EraseInitTypeDef EraseInitStruct;
+   EraseInitStruct.TypeErase = FLASH_TYPEERASE_SECTORS;
+   // ... configure sectors for Bank 2 ...
+   HAL_FLASHEx_Erase(&EraseInitStruct, &SectorError);
+   ```
 5. **Chunk Streaming (The Physical SPI Path):** How does the new file physically get from the internet into the STM32?
    * The remote Cloud server transmits TCP/IP packets over the WAN.
    * These hit the **RJ45 Ethernet Magnetics** on our board and flow into the **WIZnet W5500** chip.
@@ -1003,10 +1013,29 @@ sequenceDiagram
    * `Task_Net` on the STM32 drives the **SPI Bus** (SCK, MISO, MOSI). It sends a command over MOSI saying "Read Socket 0 Buffer". 
    * The W5500 streams the `.bin` bytes out over the MISO line. `Task_Net` catches them in a 1 Kilobyte temporary RAM array (`chunkBuffer`).
    * Finally, `Task_Net` calls `HAL_FLASH_Program()`, commanding the STM32 silicon to physically burn that 1KB RAM array permanently into the **Bank 2 Flash** transistors. This loops until the file is complete.
-6. **Validation Trailer:** Once the final chunk is downloaded, `Task_Net` writes a precisely formatted **"Magic Trailer"** (created by the python `imgtool` utility originally) to the very end of the Flash sector. 
-   * This trailer is not just a random string; it contains the TLVs (Type-Length-Values) holding the SHA-256 hash of the binary and the ECDSA P-256 cryptographic signature itself.
-   * It also forces the `image_ok` flag to `0x01` (pending) by writing specific hexadecimal values (like `0x7767AF...`) to the final 16 bytes of the slot. This explicit byte-pattern is the definitive hardware signal telling the bootloader: *"A new, completed update is sitting in Bank 2 ready for review."*
+   ```c
+   // Loop until complete file is downloaded
+   while(bytes_remaining > 0) {
+       // 1. Read 1KB over SPI from W5500 via ioLibrary_Driver
+       recv(SOCKET_OTA, chunkBuffer, 1024); 
+       
+       // 2. Burn precisely to Bank 2 Flash transistors
+       for(int i=0; i<1024; i++) {
+           HAL_FLASH_Program(FLASH_TYPEPROGRAM_BYTE, currentFlashAddress, chunkBuffer[i]);
+           currentFlashAddress++;
+       }
+   }
+   ```
+6. **The "Magic Trailer" and Cryptographic TLVs:** Once the final binary chunk is downloaded, the absolute end of the file contains the **MCUboot Trailer**.
+   * **What is it?** The trailer is a highly structured data block. It contains **TLVs (Type-Length-Values)** that hold the SHA-256 hash of the application and the actual **ECDSA P-256 signature**. At the very physical end of this structure is a fixed 16-byte "Magic" number (exactly: `0x77 0xc2 0x95 0xf3 0x60 0xd2 0xef 0x7f 0x35 0x52 0x50 0x0f 0x2c 0xb6 0x79 0x80`) and status flags (`image_ok`, `pending_update`).
+   * **Who generates it?** The remote CI/CD factory server generates it automatically using the Python `imgtool` utility during the compilation pipeline (`imgtool sign ...`).
+   * **How is it made?** `imgtool` calculates the cryptographic signature of the compiled C code, appends the TLV block, and then pads the `.bin` file with empty bytes (`0xFF`) until it reaches the exact mathematically calculated end of the Bank 2 Flash sector, placing the 16-byte Magic string at the absolute final memory address.
+   * **When and Where is it written?** Because the trailer is seamlessly appended to the `.bin` file by `imgtool`, the STM32's `Task_Net` blindly writes it into Flash **Bank 2** during the final 1-Kilobyte SPI chunk download. `Task_Net` doesn't need to understand the cryptography; it simply writes the bytes. The presence of the final 16-byte Magic string is the definitive hardware signal telling the bootloader: *"A new update has been fully written to Bank 2 and is ready for review."*
 7. **Physical Reboot:** `Task_Net` flushes the SPI buffers and fires a native ARM hardware reset vector via `NVIC_SystemReset()`.
+   ```c
+   // Tell ARM Cortex-M4 to physically restart
+   NVIC_SystemReset();
+   ```
 8. **Secure Boot Handoff:** The STM32 hardware always boots physically from address `0x08000000`. This is where **MCUboot** lives. 
    * MCUboot wakes up (completely bypassing FreeRTOS) and scans the end of the Bank 2 flash sectors looking for the Magic Trailer.
    * Finding the trailer, it reads the appended Cryptographic Signature.
@@ -1069,56 +1098,64 @@ Flash Memory Layout (Key Location):
 0x080BFFFF  └──────────────────────────────────────────┘
 ```
 
-#### Step 3: How is the MCUboot Sector Locked? (The RDP Mechanism)
+#### Step 3: How is the MCUboot Sector Locked? (RDP & WRP Mechanisms)
 
-Since the public key is in Flash (not hardware OTP), an attacker could theoretically re-flash MCUboot with a fake bootloader that passes everything. This is prevented by the STM32's **Read Protection (RDP) Option Bytes** mechanism — the closest equivalent on STM32 to eFuse burning.
+Since the public key is stored in standard Flash memory (not hardware OTP), an attacker or even a buggy pointer in our own C code could theoretically erase the bootloader and overwrite it with a fake one. 
 
-The STM32 has three RDP levels, set by writing specific values to the Option Bytes register via SWD/JTAG (done once, at factory provisioning):
+To prevent this, the STM32 utilizes two distinct hardware protection mechanisms: **RDP** (Read Out Protection) and **WRP** (Write Protection).
 
-| RDP Level | Value | What it does |
-|---|---|---|
-| **Level 0** | `0xAA` | **No protection.** Default state. SWD fully accessible. Flash readable. Debug full access. |
-| **Level 1** | `0xBB` | **Read protection.** Flash content cannot be read or dumped via SWD/JTAG. Debug interface partially restricted. Reversible — downgrading to Level 0 performs a mass Flash erase, wiping the key. |
-| **Level 2** | `0xCC` | **Permanent lock.** SWD/JTAG debug interface is **permanently and irreversibly disabled** at the silicon level. Flash cannot be read, erased, or reprogrammed via any external interface. **This is the fuse-equivalent — it cannot be undone, even by ST.** |
+**1. RDP (Read Out Protection) - External Debug Locking**
+RDP protects the *entire* chip from the outside world. It prevents anyone from plugging a ST-LINK debugger into the JTAG/SWD pins to dump or modify the memory. 
+The STM32 has three RDP levels:
+*   **Level 0:** No protection. SWD fully accessible. Flash readable and writable.
+*   **Level 1:** Read protection. Flash cannot be dumped via SWD, but downgrading to Level 0 mass-erases the entire chip (destroying the intellectual property).
+*   **Level 2:** Permanent lock. The JTAG/SWD debug pins are **permanently and irreversibly disabled** at the silicon level. The entire Flash memory cannot be read or programmed from the outside world.
 
-**Factory Provisioning Workflow:**
-```
-1. Flash MCUboot binary (containing public key) to 0x08000000 via SWD
-2. Flash the signed FreeRTOS application to 0x08040000 via SWD
-3. Write Option Bytes to set RDP = Level 2 via HAL_FLASH_OB_Launch()
-   → From this moment, SWD is permanently dead. The MCUboot + key is sealed.
-4. All future updates MUST go through the OTA path (MCUboot itself) — no debug port
-```
+**2. WRP (Write Protection) - Selective Internal Locking**
+If RDP Level 2 locks the *entire* Flash from the outside, how can `Task_Net` download a new OTA binary and save it to Bank 2? 
+Because RDP Level 2 still allows the **internal CPU** (our running application) to erase and write to Flash. 
+
+If the internal CPU can write to Flash, a malfunctioning pointer could accidentally delete the bootloader! To stop this, we use **WRP (Write Protection) Option Bytes**. WRP allows us to lock *specific sectors* of the Flash from being erased or written to, even by the internal CPU.
+
+**The Hybrid Protection Strategy (How we protect only the keys):**
+*   We apply **WRP to Sectors 0, 1, 2, and 3** (The first 64KB where MCUboot and the Public Key live). Now, even if the FreeRTOS application goes rogue, the hardware Flash Controller will physically deny any `HAL_FLASHEx_Erase()` commands aimed at the bootloader. The keys are immortal.
+*   We leave **Sectors 4 through 11** (Bank 1, Bank 2, and Scratch) **UNPROTECTED** by WRP. This allows `Task_Net` to freely erase Bank 2 and write new OTA payloads, and allows MCUboot to swap the banks.
+*   Finally, we apply **RDP Level 2** to sever the JTAG pins permanently.
+
+This achieves the exact goal: The Bootloader and Keys are mathematically and physically invulnerable, but the application space remains fully updatable over-the-air.
+
+#### Factory Provisioning Workflow (The "Locking" Ceremony)
+
+At the factory, the locking procedure is executed via an **ST-LINK hardware programmer** connected to the **SWD (Serial Wire Debug)** port. SWD is an ARM-specific, low-pin-count alternative to JTAG that provides direct memory access to the STM32.
+
+The factory typically runs a Linux bash script utilizing `openocd` or `STM32_Programmer_CLI` to orchestrate this:
+1.  **Flash MCUboot:** `STM32_Programmer_CLI -c port=SWD -w mcuboot.bin 0x08000000`
+2.  **Flash App:** `STM32_Programmer_CLI -c port=SWD -w app_signed.bin 0x08040000`
+3.  **Apply WRP & RDP via Firmware:** We trigger a unique, one-time factory firmware condition that calls the `HAL_FLASHEx_OBProgram()` API.
+    *   **Under the hood:** `HAL_FLASH_OB_Launch()` does not write to normal flash; it writes to a dedicated set of configuration transistors called "Option Bytes" residing at `0x1FFFC000`. Writing to this register forces the STM32 to immediately execute a silicon hardware reset to load the new security boundary.
+4.  **The Lock Snaps:** From the instant `HAL_FLASH_OB_Launch()` completes, the physical SWD pins `PA13` (SWDIO) and `PA14` (SWCLK) are eternally dead. The ST-LINK programmer loses connection and can never connect again. All future communication MUST go through the OTA network socket.
 
 #### Step 4: Can the Key Be Changed After Flashing (RDP Level 2)?
 
 **No. This is physically irreversible.**
 
-Once RDP Level 2 is set:
+Once RDP Level 2 and WRP are set:
 *   The SWD/JTAG pins physically stop responding — no programmer in existence can connect.
-*   The Flash controller's external read/write interface is locked by silicon fuses inside the STM32 die.
-*   Even ST Microelectronics cannot recover or reprogram the device.
-*   The only way to "change the key" would be to physically replace the STM32 chip itself.
-
-This is by design. A compromised bootloader key that can be swapped means Secure Boot offers zero security.
+*   The WRP sectors holding MCUboot cannot be erased.
+*   The only way to "change the key" would be to physically desolder and replace the STM32 chip.
 
 ---
 
-#### Comparison: MCUboot/STM32 vs AHAB/i.MX93 Secure Boot
+#### Comparison: Selective Protection (STM32) vs. Embedded Linux (i.MX93)
 
 | Aspect | **MCUboot on STM32F407** | **AHAB on i.MX93 (Linux)** |
 |---|---|---|
-| **Key Type** | ECDSA P-256 (256-bit elliptic curve) | RSA 4096 or ECDSA P-521 (SRK — Super Root Key) |
-| **Public Key Storage** | Compiled into MCUboot Flash binary at `0x08000000` | Burned as SHA256 **hash** into hardware OTP eFuse rows (SRK_HASH fuses, physically one-time-programmable) |
-| **Key Location** | Software Flash (first 64KB of internal Flash) | Hardware silicon OTP cells — physically separate from Flash |
-| **Who holds the private key** | CI/CD build server (or HSM offline) | Factory HSM (Hardware Security Module) |
-| **Signing tool** | `imgtool sign --key ecdsa-p256.pem` | `ahab-container` / NXP CST (Code Signing Tool) |
-| **Locking mechanism** | STM32 RDP Option Bytes — Level 2 (permanent SWD disable) | i.MX93 `SEC_CONFIG` eFuse — "Closed" mode (burns SRK hash + disables JTAG permanently) |
-| **Is locking reversible?** | **No** — RDP Level 2 is permanent, silicon-enforced | **No** — eFuse cells are physical one-time-programmable hardware |
-| **What happens if wrong key?** | MCUboot halts, refuses to boot any image | AHAB halts at ROM level before U-Boot ever runs |
-| **Key changeability post-lock** | Impossible — chip must be replaced | Impossible — OTP cells cannot be reprogrammed |
-| **Debug access after lock** | SWD permanently disabled | JTAG permanently disabled |
-| **Attack surface** | Flash physically accessible if RDP < 2 | OTP cells independent of Flash — higher hardware isolation |
+| **Bootloader Immortality** | Achieved via **WRP Option Bytes** locking Sectors 0-3. | Achieved via a hardcoded, unchangeable **Silicon BootROM**. |
+| **Key Storage** | Compiled as a C-array inside the WRP-locked MCUboot Flash sector. | SHA256 Hash of the key burned into physical **OTP eFuses**. |
+| **OTA Writable Area** | Bank 2 Flash is left out of the WRP lock, allowing FreeRTOS to write `.bin` files. | eMMC storage is freely writable by Linux, holding U-Boot and the RootFS. |
+| **Debug Port Lockdown** | **RDP Level 2** disables SWD/JTAG routing at the silicon level forever. | **SEC_CONFIG eFuse** "Closed Mode" physically disables JTAG routing forever. |
+| **What happens if wrong key?** | MCUboot halts, refuses to jump to Bank 1. | BootROM halts immediately, refusing to load U-Boot. |
+| **Attack surface** | Relies on WRP/RDP Option Bytes remaining uncorrupted. | Highest security. eFuses and ROM are physically immutable hardware. |
 | **Root of Trust location** | Software bootloader in Flash (MCUboot) | Silicon ROM + OTP hardware (higher assurance) |
 
 **The Fundamental Architecture Difference:**
@@ -1274,6 +1311,83 @@ dfu-util -a 0 -s 0x08000000:leave -D mcuboot.bin
 dfu-util -a 0 -s 0x08040000:leave -D ems_rtos_signed.bin
 ```
 
+**Is USB DFU Supported in our specific `ems-mini-rtos` setup?**
+
+*Technically yes, but practically no.*
+
+The STM32F407 silicon features two dedicated hardware USB PHY pins (`PA11` for USB_DM, `PA12` for USB_DP). However, in an industrial Energy Management System:
+1.  **Enclosure Accessibility:** The physical hardware is sealed inside a DIN-rail plastic enclosure inside a high-voltage electrical cabinet. A technician cannot easily plug a USB-C cable into the board.
+2.  **OTA Primary Route:** The board has a physical RJ45 Ethernet port routed through the W5500 via SPI. All firmware updates are designed to flow through the Cloud via MQTT/MQTTS.
+3.  **Boot PIN Contention:** USB DFU requires a technician to physically toggle the `BOOT0` pin HIGH with a jumper while resetting the board. An embedded system cannot do this to itself easily without complex reset circuitry.
+
+Therefore, while the STM32 *supports* DFU natively in its immutable BootROM, we do not utilize it. We flash the device exactly once at the factory using the **SWD (ST-LINK) Method**, lock it, and rely purely on **Method 1 (Ethernet OTA)** thereafter.
+
+```mermaid
+flowchart LR
+    classDef stm fill:#276749,stroke:#fff,stroke-width:2px,color:#fff
+    classDef bad fill:#742a2a,stroke:#fff,stroke-width:2px,color:#fff
+    classDef good fill:#2b6cb0,stroke:#fff,stroke-width:2px,color:#fff
+    classDef mem fill:#38a169,stroke:#fff,stroke-width:1px,color:#fff
+
+    subgraph Hardware ["Industrial DIN-Rail Enclosure"]
+        A(STM32F407):::stm
+        B[PA11/PA12\nHardware USB_FS Pins]:::bad
+        C[SPI1 Bus]:::good
+        D[W5500 Ethernet SPI PHY]:::good
+        E[RJ45 Port]:::good
+
+        A --> B
+        B -. "Inaccessible/No Connector" .-> X(Technician Laptop)
+        A <== "Primary High-Speed Comm" ==> C
+        C <== "Hardware Accelerated" ==> D
+        D <== "Transformer Magnetics" ==> E
+    end
+    
+    E <== "Permanent Connection" ==> Cloud(Cloud MQTT Server)
+```
+
+---
+
+#### The Connectivity Architecture: How Does Flashing Actually Work?
+
+Before we look at the complete factory script, it is crucial to understand the physical and software layers involved in programming an STM32 from a Linux PC.
+
+**Do we need to program all images (mcuboot, flash) separately?**
+**Yes, absolutely.** At the factory, a blank STM32 chip has nothing but `0xFF` across its entire 1MB of memory. You cannot just flash the FreeRTOS app, because the STM32 hardware always boots from `0x08000000`, and our app is built to run at `0x08040000`. 
+1. The **Bootloader (`mcuboot.bin`)** must be flashed to address `0x08000000`.
+2. The **Signed Application (`ems_rtos_signed.bin`)** must be flashed to address `0x08040000`.
+
+To achieve this, the developer's PC uses a piece of software (like OpenOCD) acting as a bridge to a hardware dongle (ST-LINK), which translates USB commands into raw electrical logic on the SWD pins.
+
+```mermaid
+flowchart TD
+    %% Define Styles
+    classDef pc fill:#1a365d,stroke:#fff,stroke-width:2px,color:#fff
+    classDef sw fill:#2b6cb0,stroke:#fff,stroke-width:1px,color:#fff
+    classDef dongle fill:#c53030,stroke:#fff,stroke-width:2px,color:#fff
+    classDef stm fill:#276749,stroke:#fff,stroke-width:2px,color:#fff
+    classDef mem fill:#38a169,stroke:#fff,stroke-width:1px,color:#fff
+
+    subgraph Linux_PC ["Linux Workstation"]
+        A[Terminal / Bash Script]:::pc --> B[OpenOCD / ST-LINK Utility]:::sw
+        C[imgtool: Signing Keys]:::sw --> A
+    end
+
+    subgraph Dongle ["ST-LINK V2 / V3 Programmer"]
+        B -- "USB (Bulk Transfer)" --> D[ST-LINK Hardware dongle]:::dongle
+    end
+
+    subgraph STM32 ["STM32F407 Target Board"]
+        D -- "SWDIO (Pin PA13)\nSWCLK (Pin PA14)\nGND" --> E(SWD Debug Access Port):::stm
+        E --> F((Cortex-M4 Core)):::stm
+        F --> G[Flash: 0x0800 0000 \n MCUboot + PubKey]:::mem
+        F --> H[Flash: 0x0804 0000 \n Signed FreeRTOS App]:::mem
+    end
+```
+
+*   **SWD (Serial Wire Debug):** A 2-wire interface (`SWDIO` for data, `SWCLK` for clock) created by ARM. It allows the ST-LINK dongle to halt the Cortex-M4 CPU, read its registers, and command the internal Flash Controller to burn our `.bin` files directly into the silicon.
+*   **OpenOCD (Open On-Chip Debugger):** An open-source Linux daemon that knows how to talk "USB" to the ST-LINK dongle, and translates high-level commands (like `flash write_image mcuboot.bin 0x08000000`) into the low-level SWD bit-banging required by the ARM core.
+
 ---
 
 #### Complete End-to-End Factory Provisioning Workflow
@@ -1288,21 +1402,53 @@ This is the **definitive production programming procedure** for a brand new STM3
 ║  Private Key:   ecdsa-p256.pem  (on factory build server ONLY)      ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-STEP 1 ── Generate signing keys (first-time, factory setup only)
+STEP 1 ── Verify ST-LINK and STM32 Target Connection
+─────────────────────────────────────────────────────────────────────
+  # Before flashing, the factory PC must probe the SWD interface to
+  # assert that the ST-LINK dongle sees a valid Cortex-M4 core.
+  st-info --probe
+  
+  # Expected Output:
+  # Found 1 stlink programmers
+  #  version:  V2J29S7
+  #  serial:   ...
+  #  flash:    1048576 (pagesize: 16384)
+  #  sram:     131072
+  #  chipid:   0x0413
+  #  descr:    F4 device
+
+```mermaid
+sequenceDiagram
+    participant PC as Linux Workstation
+    participant ST as ST-LINK (USB Dongle)
+    participant Core as STM32 (SWD Pins)
+    
+    PC->>ST: USB Bulk: "Who are you?" (st-info)
+    ST-->>PC: "I am ST-LINK v2. Ready."
+    PC->>ST: "Probe SWD interface at 4000kHz"
+    ST->>Core: SWDIO/SWCLK: Halt CPU & Read IDCODE
+    Core-->>ST: Returns 0x0413 (STM32F407)
+    ST->>Core: Read Flash Size Register
+    Core-->>ST: Returns 0x100000 (1MB)
+    ST-->>PC: "Target found: 1MB Flash, 128KB RAM"
+    Note over PC,Core: DEVICE VERIFIED & READY TO FLASH
+```
+
+STEP 2 ── Generate signing keys (first-time, factory setup only)
 ─────────────────────────────────────────────────────────────────────
   imgtool keygen -k ecdsa-p256.pem -t ecdsa-p256
   imgtool getpub -k ecdsa-p256.pem > boot/root-ec-p256-pub.c
   → Store ecdsa-p256.pem in offline HSM or encrypted vault
   → Commit root-ec-p256-pub.c into MCUboot source tree
 
-STEP 2 ── Build MCUboot with the embedded public key
+STEP 3 ── Build MCUboot with the embedded public key
 ─────────────────────────────────────────────────────────────────────
   cd mcuboot/boot/stm32/
   make BOARD=stm32f407 SIGNING_KEY=../../../root-ec-p256-pub.c
   → Produces: mcuboot.bin
   → Public key is baked as const array at 0x08000000+offset
 
-STEP 3 ── Build and sign the FreeRTOS application
+STEP 4 ── Build and sign the FreeRTOS application
 ─────────────────────────────────────────────────────────────────────
   # Compile the EMS RTOS firmware (produces raw binary)
   arm-none-eabi-gcc ... -o ems_rtos.elf
@@ -1319,48 +1465,48 @@ STEP 3 ── Build and sign the FreeRTOS application
     ems_rtos_signed.bin
   → Produces: ems_rtos_signed.bin (with MCUboot header + ECDSA signature appended)
 
-STEP 4 ── Erase the target board (factory fresh)
+STEP 5 ── Erase the target board (factory fresh)
 ─────────────────────────────────────────────────────────────────────
   st-flash erase
   → Wipes all 1MB of Flash to 0xFF
 
-STEP 5 ── Flash MCUboot (bootloader + embedded public key)
+STEP 6 ── Flash MCUboot (bootloader + embedded public key)
 ─────────────────────────────────────────────────────────────────────
   st-flash write mcuboot.bin 0x08000000
   → MCUboot + public key now lives at sectors 0–3 (0x08000000–0x0800FFFF)
 
-STEP 6 ── Flash the signed FreeRTOS application
+STEP 7 ── Flash the signed FreeRTOS application
 ─────────────────────────────────────────────────────────────────────
   st-flash write ems_rtos_signed.bin 0x08040000
   → Application lives at Bank 1 (0x08040000–0x080BFFFF)
+```
 
-STEP 7 ── Power-cycle test (verify Secure Boot passes)
+**STEP 8 ── Validation Test (CRUCIAL: Verify keys before locking!)**
+Before setting the final hardware locks, it is perfectly safe to reboot the board and verify the signatures.
+*   **Action:** Press the physical RESET button or power cycle the board.
+*   **Observe:** Watch the UART serial output (or SWD debug viewer).
+*   ✅ **Expected SUCCESS:** `"MCUboot: Verifying signature... OK! Booting application."`
+*   ❌ **Expected FAILURE:** `"MCUboot: Signature INVALID! Halting."` 
+    *   **STOP:** Do not proceed to Step 9 if validation fails. You still have unlimited flash retries to fix the keys since RDP is still Level 0.
+
+```bash
+STEP 9 ── Set RDP Level (Locking the Debug Port)
 ─────────────────────────────────────────────────────────────────────
-  # Power cycle the board
-  # Observe SWD debug output or UART log:
-  # Expected: "MCUboot: Verifying signature... OK! Booting application."
-  # If signature fails: "MCUboot: Signature INVALID! Halting."
+  # Option A: Set RDP Level 1 (Development / Recoverable via Mass Erase)
+  STM32_Programmer_CLI -c port=SWD -ob RDP=0xBB
+  
+  # Option B: Set RDP Level 2 (Production / IRREVERSIBLE)
+  # ⚠️ WARNING: SWD/JTAG debug port will be PERMANENTLY DISABLED. OTA ONLY.
+  STM32_Programmer_CLI -c port=SWD -ob RDP=0xCC
 
-STEP 8 ── PERMANENT LOCK: Set RDP Level 2 (IRREVERSIBLE — DO LAST)
-─────────────────────────────────────────────────────────────────────
-  # Using STM32_Programmer_CLI (part of STM32CubeProgrammer package)
-  STM32_Programmer_CLI \
-    -c port=SWD \
-    -ob RDP=0xCC
-
-  # Alternatively via OpenOCD:
+  # Option C: OpenOCD approach (Applies WRP and RDP Level 2)
   openocd -f interface/stlink.cfg -f target/stm32f4x.cfg \
-    -c "init; reset halt; \
-        flash protect 0 0 11 on; \
-        stm32f4x options_write 0 0xCC; \
-        reset run; exit"
-
-  ⚠️  WARNING: After this command completes:
-    - SWD/JTAG is PERMANENTLY disabled
-    - Flash cannot be read, dumped, or re-programmed externally
-    - Even ST Microelectronics cannot unlock this device
-    - The ONLY update path remaining is MCUboot OTA over Ethernet
-    - If you need to debug after this, you need a new chip
+    -c "init" \                       # Connects to ST-LINK
+    -c "reset halt" \                 # Freezes STM32
+    -c "flash protect 0 0 3 on" \     # Engages WRP on Sectors 0-3
+    -c "stm32f4x options_write 0 0xCC" \ # Engages RDP Level 2
+    -c "reset run" \                  # Reboots, enforcing permanent lock
+    -c "exit"
 ```
 
 ---
@@ -1397,12 +1543,19 @@ LOCK TOOL: STM32_Programmer_CLI          LOCK TOOL: uuu + blhost
 
 ---
 
-#### STM32_Programmer_CLI Reference (Headless STM32CubeProgrammer)
+#### STM32CubeProgrammer & STM32_Programmer_CLI Reference
 
-`STM32_Programmer_CLI` is the command-line version of STM32CubeProgrammer — useful for scripts and CI/CD:
+**STM32CubeProgrammer (GUI vs CLI)**
+STMicroelectronics provides `STM32CubeProgrammer` as a cross-platform software suite available for **Windows, macOS, and Linux**. 
+*   **The GUI Version:** A full graphical application primarily used by developers on Windows/Mac to visually inspect memory, drag-and-drop `.bin` files, edit Option Bytes with checkboxes, and debug STM32 chips.
+*   **The CLI Version (`STM32_Programmer_CLI`):** Installed alongside the GUI, this is the headless command-line executable. It allows the exact same operations but is designed strictly for automation, bash scripts, and CI/CD factory pipelines (e.g., locking the chip automatically on a Linux server).
+
+Here are the most common CLI commands used in scripting:
 
 ```bash
 # Connect and read device info
+# Note: `freq=4000` tells the ST-LINK to communicate over the SWD pins at 4000 kHz (4 MHz). 
+# This is the highly recommended standard speed that balances stability and flashing speed for STM32F4.
 STM32_Programmer_CLI -c port=SWD freq=4000 -i
 
 # Full erase
@@ -1451,10 +1604,12 @@ If a forklift unplugs the board exactly while MCUboot is swapping chunks, MCUboo
 **What happens if the newly updated active partition is corrupted or crashes?**
 We implemented an **"Image Confirmation"** fail-safe mechanism:
 *   After MCUboot swaps Bank 2 into Bank 1, it passes the boot sequence to the new application. 
-*   The new FreeRTOS application must successfully initialize, connect to the Cloud, and eventually call a specific C API: `boot_set_confirmed()`.
-*   If the new firmware contains a fatal bug (e.g., a Hard Fault, or it was larger than 384KB and overwrote itself), the CPU will crash *before* it can ever call `boot_set_confirmed()`.
-*   The hardware **Independent Watchdog (IWDG)** will detect the freeze and automatically reset the CPU. 
-*   MCUboot wakes up, checks the flags, realizes the new firmware failed to confirm itself, and instantly **REVERTS** the swap, pulling the old, stable firmware out of the Scratch area and back into Bank 1!
+*   **The Flag:** MCUboot relies on a specific byte called the `image_ok` flag to know if the new firmware is stable. 
+*   **Where is it?** This flag is located at the very end of the active Flash partition (Bank 1), locked inside the cryptographic "Magic Trailer" metadata block. Like all erased flash, it defaults to `0xFF` (Unconfirmed).
+*   **Who sets it?** The new FreeRTOS application must successfully initialize, connect to the Cloud, and eventually execute a specific C API call: `boot_set_confirmed()`. This function physically writes `0x01` to the `image_ok` memory address in the Magic Trailer.
+*   **The Crash Scenario:** If the new firmware contains a fatal bug (e.g., a Hard Fault, or it infinite-loops and drops the network), the CPU will crash *before* it can ever call `boot_set_confirmed()`. 
+*   **The Revert:** The hardware **Independent Watchdog (IWDG)** will detect the freeze and automatically reset the CPU. 
+*   **Who clears/reads it?** MCUboot wakes up, reads the Magic Trailer in Bank 1, and sees that `image_ok` is still `0xFF` (the app failed to set it to `0x01`). MCUboot realizes the new firmware failed to confirm itself, and it instantly **REVERTS** the swap, pulling the old, stable firmware out of the Scratch area and back into Bank 1!
 
 ---
 
@@ -1465,7 +1620,13 @@ If you inspect the codebase, you will notice we use commands like `osDelay()` an
 ### Why use CMSIS-RTOS v2 instead of native FreeRTOS without CMSIS?
 1. **Portability & Abstraction:** CMSIS-RTOS v2 is a standardized API created by ARM. By using it, our application code doesn't strictly know it is running "FreeRTOS". If, in the future, we need to migrate the EMS Mini to an RTOS provided by another vendor (like Keil RTX, Azure RTOS/ThreadX, or Zephyr), we do not have to rewrite a single line of application code. The `osThreadNew()` command works universally across ARM-supported RTOS platforms, whereas `xTaskCreate()` strictly locks us into FreeRTOS.
 2. **Simplified Memory Management:** Native FreeRTOS requires developers to manually choose between static (`xTaskCreateStatic`) and dynamic (`xTaskCreate`) allocations, frequently requiring the user to pass convoluted RAM buffers manually. The CMSIS v2 wrapper unifies these calls: you simply pass an attributes struct (`osThreadAttr_t`).
-3. **Advanced 64-bit Timers:** CMSIS-RTOS v2 introduces unified 64-bit kernel tick structures `osKernelGetTickCount()`. Native FreeRTOS traditionally defaults to 32-bit ticks, which roll over back to zero every ~49 days (on a 1ms tick), requiring nasty manual rollover-protection logic. A 64-bit tick will not roll over for billions of years, making uptime math (like "publish MQTT every 5 seconds") extremely safe and simple.
+3. **Advanced Timers:** CMSIS-RTOS v2 introduces unified 64-bit kernel tick structures `osKernelGetTickCount()`. Native FreeRTOS traditionally defaults to 32-bit ticks, which roll over back to zero every ~49 days (on a 1ms tick), requiring nasty manual rollover-protection logic. A 64-bit tick will not roll over for billions of years, making uptime math (like "publish MQTT every 5 seconds") extremely safe and simple.
+
+### Why CMSIS-RTOS v2 specifically (vs. CMSIS-RTOS v1)?
+If you are upgrading from older STM32Cube firmware that used **v1**, here are the major differences you will notice in this codebase:
+*   **No More Macro Definitions:** In v1, creating a thread required clunky multi-step macros like `osThreadDef()` followed by `osThreadCreate()`. In **v2**, this is completely replaced by clean, dynamic C functions like `osThreadNew()` and `osMessageQueueNew()`.
+*   **True 64-bit Ticks:** v1 was strictly bound to a 32-bit SysTick (`osWaitForever` was max 0xFFFFFFFF). **v2** officially supports infinite 64-bit ticks out of the box.
+*   **Variable Message Sizes:** In v1, Message Queues (`osMessagePut`) were essentially limited to passing 32-bit integer values or raw pointers. **v2** (`osMessageQueuePut`) natively allows you to pass actual `struct` data payload clones of any arbitrary memory size, significantly improving type safety across threads.
 
 ---
 
@@ -1481,12 +1642,15 @@ This section serves as a rapid-fire summary of the specific FreeRTOS API mechani
 ### 2. Message Queues (`osMessageQueueNew` / `osMessageQueuePut`)
 *   **What:** Thread-safe, FIFO (First-In, First-Out) memory buffers.
 *   **Why:** To safely pass complex data (like the Multi-Byte `SystemState_t` struct) between isolated Tasks without using completely unprotected global variables (which cause Data Corruptions/Race Conditions).
-*   **How:** `Task_Poll` calls `osMessageQueuePut()` to insert data. `Task_Ctrl` calls `osMessageQueueGet(..., osWaitForever)`. The magic here is the `osWaitForever`—the RTOS parks `Task_Ctrl` at 0% CPU load permanently. The kernel itself wakes the task up the exact microsecond the data lands in the queue.
+*   **How:** `Task_Poll` generates data and calls `osMessageQueuePut()` to insert it into the buffer. Meanwhile, `Task_Ctrl` is programmed to call `osMessageQueueGet(..., osWaitForever)`. 
+    *   **The Magic of `osWaitForever`:** If the queue is empty, `Task_Ctrl` does *not* sit in a `while(1)` loop constantly checking the queue (which would burn 100% CPU purely on waiting). 
+    *   Instead, the RTOS kernel explicitly removes `Task_Ctrl` from the active "Ready-to-Run" list and places it in a dormant "Blocked" list. Because it is blocked, it consumes **exactly 0% CPU cycles**.
+    *   The microsecond `Task_Poll` executes `osMessageQueuePut()`, a hardware/software interrupt tells the RTOS kernel: *"Data has arrived in Queue X"*. The kernel instantly scans its Blocked list, finds `Task_Ctrl` waiting for that queue, and physically moves `Task_Ctrl` back to the active "Ready" list, immediately waking it up to process the data!
 
 ### 3. Binary Semaphores (`osSemaphoreNew` / `osSemaphoreAcquire`)
 *   **What:** A thread-safe boolean "Token". You either have it, or it is empty.
-*   **Why:** To synchronize a high-level software Task with a low-level physical Silicon event (like a DMA transfer finishing).
-*   **How:** When `Task_Poll` fires off a DMA transfer, it immediately calls `osSemaphoreAcquire()`. Since the token is empty, the Task instantly sleeps. When the hardware finishes, the native `UART ISR` fires. From inside the ISR space, we call `osSemaphoreRelease()`. This injects the missing token into the RTOS kernel, which instantly unblocks `Task_Poll`.
+*   **Why (The `Task_Poll` Use Case):** In `Task_Poll`, we communicate over a slow RS-485 Modbus network (e.g., 9600 baud). If we busy-looped while waiting for a 100-byte packet to arrive, the CPU would be frozen for over 100 milliseconds! A Binary Semaphore allows `Task_Poll` to kick off the hardware DMA (Direct Memory Access) and then instantly go to sleep (0% CPU), freeing the CPU to run `Task_Net` or `Task_Ctrl` while the hardware physical UART pins do the slow work.
+*   **How:** `Task_Poll` fires off a DMA transfer (`HAL_UART_Transmit_DMA`), then immediately calls `osSemaphoreAcquire()`. Since the token starts empty, the Task is instantly Blocked. Milliseconds later, when the remote Modbus slave finishes responding, theSTM32 hardware fires the native `UART Idle ISR`. From inside that Interrupt Service Routine, we call `osSemaphoreRelease()`. This injects the missing token into the RTOS kernel, which instantly unblocks `Task_Poll` so it can parse the newly arrived buffer!
 
 **Semaphore ISR → Task Unlock Pseudo-Code:**
 ```c
@@ -1526,7 +1690,40 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
 
 ---
 
-## 9. Unused FreeRTOS Features
+---
+
+## 9. System Timing & Frequencies Cheat Sheet
+
+For technical interviews and architectural reviews, it is extremely common to be asked about the exact timing characteristics, hardware bus speeds, and RTOS configurations of your system. 
+
+Here is the master lookup table detailing the exact clock frequencies, speeds, and task durations configured for `ems-mini-rtos`:
+
+### ⏱️ Hardware Clocks & Bus Speeds
+
+| Component / Interface | Configured Speed | Description & Architectural Purpose |
+| :--- | :--- | :--- |
+| **SYSCLK (Core CPU)** | `168 MHz` | The absolute maximum speed of the STM32F407 ARM Cortex-M4 core. Powers the FPU (Floating Point Unit) for complex peak-shaving math. |
+| **APB1 Peripheral Bus** | `42 MHz` | The low-speed peripheral bus. Drives standard Timers, I2C, and secondary UARTs. |
+| **APB2 Peripheral Bus** | `84 MHz` | The high-speed peripheral bus. Drives critical components like the ADCs, USART1, and SPI1. |
+| **W5500 (SPI1)** | `21.0 MBits/s` | `APB2 divided by 4`. High-speed hardware SPI communication strictly used for pushing massive MQTT payloads to the Cloud via Ethernet. |
+| **RS-485 Modbus (USART1)** | `9600 Baud` | Translates to roughly `~1ms per byte`. Industry standard for communicating with third-party Smart Meters over hundreds of meters of noisy wire without signal degradation. |
+| **CAN Bus** | `500 kbps` | Translates to roughly `2µs per bit`. High speed, highly reliable differential signaling used to communicate with internal Battery Management Systems (BMS). |
+| **SWD Flashing Clock** | `4000 kHz` (`4 MHz`) | Parameter passed via `freq=4000`. Balances write-speed and electrical stability when the factory burns firmware into the silicon. |
+
+### ⏳ RTOS Scheduling & Software Timings
+
+| Software Component | Duration / Interval | Description & Architectural Purpose |
+| :--- | :--- | :--- |
+| **SysTick (Kernel Heartbeat)** | `1 ms` (`1000 Hz`) | The FreeRTOS baseline. Every single millisecond, the CPU hardware interrupts the current code, runs the OS Scheduler, and decides if a higher priority task needs the CPU. |
+| **`Task_Poll` Cycle** | `300 ms` | Uses `osDelay(300)`. The hardware polling task wakes up roughly 3.3 times per second to poll external sensors. |
+| **Modbus DMA Timeout** | `250 ms` | Uses `osSemaphoreAcquire(..., 250)`. If a slave device burns out or the wire is cut, we abort the wait after 250ms to prevent the RTOS from freezing forever. |
+| **`Task_Ctrl` Wait Time** | `osWaitForever` (`∞`) | The Brain task consumes 0% CPU unless data actively arrives in its Message Queue from `Task_Poll`. It has no fixed interval. |
+| **`Task_Net` Cycle (MQTT)** | `5000 ms` | We only publish to the AWS IoT Cloud every 5 seconds. This saves massive cellular/data costs while retaining "real-time" dashboard feels. |
+| **IWDG (Watchdog Timer)** | `~2.5 to 3.0 sec` | An independent, analog silicon timer. If the FreeRTOS engine crashes (Hard Fault) and fails to reset this timer within 3 seconds, the hardware forcibly physically reboots the board. |
+
+---
+
+## 10. Unused FreeRTOS Features
 
 While we utilized the core pillars of FreeRTOS, there are specific features we actively **chose not to use** to keep the architecture deterministic and memory-safe:
 
@@ -1537,7 +1734,7 @@ While we utilized the core pillars of FreeRTOS, there are specific features we a
 
 ---
 
-## 10. Project Design & Team Methodology
+## 11. Project Design & Team Methodology
 
 From a corporate team perspective, architecting a bare-metal RTOS from scratch requires extreme discipline. We built this step-by-step:
 
@@ -1586,13 +1783,64 @@ Automated **Static Analysis** (such as `Cppcheck`) is intrinsically integrated i
 *   MISRA C compliance checks (e.g., verifying `malloc()` is never called dynamically).
 
 **3. Hardware-In-The-Loop (HIL) Integration Testing:**
-For physical testing, we built an automated Python test rig. A PC connected via an RS-485 adapter blasts fake Inverter Modbus parameters directly to the STM32 board, while a script actively sniffs the MQTT Cloud outputs to verify the RTOS is packaging and reacting with zero dropped frames.
+For physical testing, we built an automated Python test rig that integrates directly into the CI/CD pipeline. The goal is simple: **prove the firmware works on real silicon before any human approves the Pull Request.**
+
+The HIL test cycle works as follows:
+1.  **CI/CD Trigger:** A developer pushes a Pull Request on GitHub. GitHub Actions triggers the automated pipeline.
+2.  **Build Phase:** The CI server (a Linux Docker container) compiles the firmware using `arm-none-eabi-gcc`, runs `Cppcheck` static analysis, and produces the signed `.bin` artifact via `imgtool`.
+3.  **Flash Phase:** The CI server (which has a physical STM32 board connected via USB ST-LINK) flashes the freshly built `.bin` to the Device Under Test (DUT) using `st-flash write`.
+4.  **Stimulation Phase:** A Python script (`hil_simulator.py`) injects pre-recorded Modbus RTU telegrams (fake Grid Meter + Inverter data) into the STM32's RS-485 port via a USB-to-RS485 adapter.
+5.  **Observation Phase:** A second Python script (`mqtt_sniffer.py`) subscribes to the AWS IoT MQTT broker and captures every JSON telemetry packet the STM32 publishes in response.
+6.  **Verdict Phase:** The sniffer compares the received JSON values against a mathematical model (e.g., "If we injected GridWatts=5000 and BatterySOC=80, the inverter command MUST be ≤3000W"). If all assertions pass, the CI pipeline reports ✅ **PASS**. If any value is out of bounds, it reports ❌ **FAIL** and blocks the PR merge.
+
+```mermaid
+flowchart TD
+    classDef ci fill:#462873,stroke:#a06cd5,stroke-width:2px,color:#fff
+    classDef pc fill:#0b3b60,stroke:#333,stroke-width:2px,color:#fff
+    classDef hw fill:#1e1e1e,stroke:#00a3cc,stroke-width:2px,color:#fff
+    classDef cloud fill:#8c1b11,stroke:#e63946,stroke-width:2px,color:#fff
+    classDef result fill:#0f5e2d,stroke:#3ea662,stroke-width:2px,color:#fff
+
+    PR["Developer Pushes<br>Pull Request on GitHub"]:::ci
+    BUILD["GitHub Actions CI Server<br>Compiles .bin + Signs with imgtool"]:::ci
+    FLASH["st-flash write<br>Flashes DUT via USB ST-LINK"]:::pc
+    DUT["STM32F407 Board<br>(Device Under Test)"]:::hw
+    SIM["hil_simulator.py<br>Injects Fake Modbus via RS-485 USB"]:::pc
+    CLOUD["AWS IoT MQTT Broker<br>(Captures Telemetry)"]:::cloud
+    SNIFF["mqtt_sniffer.py<br>Subscribes & Validates JSON Output"]:::pc
+    VERDICT["CI Reports ✅ PASS or ❌ FAIL<br>on the GitHub Pull Request"]:::result
+
+    PR --> BUILD
+    BUILD --> FLASH
+    FLASH --> DUT
+    SIM -->|"Fake GridWatts, BatterySOC"| DUT
+    DUT -->|"Real JSON Telemetry via Ethernet"| CLOUD
+    CLOUD --> SNIFF
+    SNIFF -->|"Assertions: InverterCmd ≤ 3000W?"| VERDICT
+    VERDICT -->|"Block or Approve PR"| PR
+```
 
 ---
 
 ## 12. Toolchain & Advanced Debugging Stack
 
 Developing bare-metal code with physical hardware interfaces requires professional embedded tooling. `printf()` debugging over a serial port is wildly insufficient.
+
+```mermaid
+flowchart TD
+    classDef ide fill:#0f5e2d,stroke:#3ea662,stroke-width:2px,color:#fff
+    classDef tool fill:#8c5614,stroke:#d98d2b,stroke-width:2px,color:#fff
+    classDef hw fill:#1e1e1e,stroke:#00a3cc,stroke-width:2px,color:#fff
+
+    A["STM32CubeIDE / Developer PC<br>(Eclipse Editor + GCC ARM)"]:::ide
+    B["GDB Debugger<br>(OpenOCD Protocol)"]:::tool
+    C["ST-LINK V2 / V3<br>(Hardware USB Debug Probe)"]:::hw
+    D["STM32F407 Silicon<br>(SWD Debug Pins)"]:::hw
+
+    A -->|"Compiles .elf & launches debug sequence"| B
+    B -->|"Translates memory requests"| C
+    C <-->|"Hardware breakpoints & live RAM inspection"| D
+```
 
 *   **IDE & Compiler:** We explicitly use **`STM32CubeIDE`** (Eclipse-based) natively compiling with the open-source `GCC ARM Embedded` toolchain. 
     *   **Why not Keil µVision?** A common corporate alternative is Keil (owned by ARM). While Keil has an exceptionally optimized proprietary compiler (`armcc`), its commercial licensing is astronomically expensive (often thousands of dollars per seat) and historically ties developers to Windows environments, sometimes via physical USB dongles. `STM32CubeIDE` is completely **free**, cross-platform natively (Linux / Mac / Windows), and intimately couples with the `STM32CubeMX` graphical configuration tool. Because it utilizes standard open-source GCC, we can cleanly extract the build system and seamlessly compile our firmware inside an automated, headless Linux Docker container on our CI/CD server without engaging in complex, expensive licensing battles.
@@ -1603,18 +1851,191 @@ Developing bare-metal code with physical hardware interfaces requires profession
 *   **Protocol Analyzers (Saleae Logic):** To ensure our RS-485 `DE` pin toggles exactly when the Modbus DMA finishes, we use a Logic Analyzer. By clamping the probes to PA2 (TX), PA3 (RX), and PD4 (DE), we verify the microsecond-level hardware timing.
 *   **RTOS Tracing (SystemView):** We instrument FreeRTOS with Trace macros (e.g., SEGGER SystemView). This allows us to record a visual timeline on a PC showing exactly when the scheduler swaps tasks, proving that `Task_Ctrl` takes 0% CPU until `Queue_Data` triggers it.
 
+### How Debug Printing Works (ITM/SWO Trace)
+
+Standard `printf()` over UART is **dangerous in an RTOS** because:
+1. `printf()` is not thread-safe — two tasks calling it simultaneously corrupt the output buffer.
+2. UART TX at 115200 baud takes **~870µs per 100 characters** — this blocks the calling task, starving real-time Modbus and CAN processing.
+3. It requires a physical UART-to-USB cable, consuming a UART peripheral that we need for Modbus.
+
+Instead, we use the ARM Cortex-M4's built-in **ITM (Instrumentation Trace Macrocell)** hardware, streamed over the **SWO (Serial Wire Output)** pin (`PB3`). This sends debug messages at **full SWD clock speed (4 MHz+)** through the same ST-LINK USB cable already used for programming — zero extra wires, zero CPU blocking.
+
+```mermaid
+flowchart LR
+    classDef fw fill:#0f5e2d,stroke:#3ea662,stroke-width:2px,color:#fff
+    classDef hw fill:#1e1e1e,stroke:#00a3cc,stroke-width:2px,color:#fff
+    classDef pc fill:#462873,stroke:#a06cd5,stroke-width:2px,color:#fff
+
+    CODE["Task_Ctrl calls<br>ITM_SendChar('H')"]:::fw
+    ITM["ARM ITM Hardware<br>(Stimulus Port 0)"]:::hw
+    SWO["SWO Pin (PB3)<br>4 MHz async serial"]:::hw
+    STLINK["ST-LINK V2<br>(USB Debug Probe)"]:::hw
+    IDE["STM32CubeIDE<br>SWV Console Window"]:::pc
+
+    CODE -->|"Single register write<br>~1 CPU cycle"| ITM
+    ITM -->|"Hardware FIFO buffer"| SWO
+    SWO -->|"Physical wire on PCB"| STLINK
+    STLINK -->|"USB to PC"| IDE
+```
+
+**Implementation — Custom `_write()` syscall redirect:**
+
+Instead of rewriting every `printf`, we override the low-level C library `_write()` function that `printf` calls internally. This transparently redirects all `printf()` output to the ITM hardware:
+
+```c
+// ──── File: Core/Src/syscalls.c ────
+
+#include "stm32f4xx.h"
+
+// Override the C library's _write() to use ITM instead of UART
+int _write(int file, char *ptr, int len) {
+    for (int i = 0; i < len; i++) {
+        ITM_SendChar(*ptr++);
+        // ↑ This writes a single byte to ITM Stimulus Port 0.
+        // It takes ~1 CPU cycle (just a register write).
+        // The ITM hardware has a FIFO — it will NOT block the CPU
+        // unless the FIFO overflows (extremely rare at 4 MHz SWO).
+    }
+    return len;
+}
+```
+
+**Usage in firmware (identical to standard printf):**
+```c
+// Inside Task_Poll — completely safe, non-blocking
+void Task_Poll(void *argument) {
+    for (;;) {
+        modbus_read_all_slaves();
+        printf("[POLL] GridW=%d, BattSOC=%d%%, InvCmd=%dW\n",
+               state.grid_watts, state.battery_soc, state.inverter_cmd);
+        // ↑ This does NOT go to UART.
+        // It goes to ITM → SWO → ST-LINK → STM32CubeIDE SWV Console.
+        // Takes < 5µs for 50 characters. Zero impact on RTOS.
+
+        HAL_IWDG_Refresh(&hiwdg);
+        osDelay(300);
+    }
+}
+```
+
+**Viewing the output:**
+In STM32CubeIDE: `Window → Show View → SWV → SWV ITM Data Console`. Set the SWO clock to match your core clock (168 MHz) and enable Stimulus Port 0. You'll see live `printf` output streaming at full speed.
+
+> ⚠️ **Production Note:** In production builds, we compile with `-DNDEBUG` which strips all `printf()` calls via a macro: `#ifdef NDEBUG #define printf(...) ((void)0) #endif`. This removes 100% of trace overhead from the release binary.
+
 ---
 
 ## 13. Hardware Selection: Why the STM32F407?
 
 In a market saturated with microcontrollers, why did the team specifically select the STM32F407VGT6 for this Energy Management System?
 
+```mermaid
+flowchart LR
+    classDef req fill:#8c1b11,stroke:#e63946,stroke-width:2px,color:#fff
+    classDef feat fill:#0f5e2d,stroke:#3ea662,stroke-width:2px,color:#fff
+
+    subgraph "Project Requirements"
+        R1["Peak-Shaving<br>Float Math"]:::req
+        R2["Deterministic<br>ISR Priority"]:::req
+        R3["Zero-CPU<br>Data Transport"]:::req
+        R4["Secure Dual-Bank<br>OTA Updates"]:::req
+        R5["Industrial Comms<br>CAN + RS-485"]:::req
+    end
+
+    subgraph "STM32F407 Silicon Features"
+        F1["Cortex-M4F<br>Hardware FPU"]:::feat
+        F2["ARM NVIC<br>16 Priority Levels"]:::feat
+        F3["2x DMA Controllers<br>16 Streams"]:::feat
+        F4["1MB Internal Flash<br>No External Chip"]:::feat
+        F5["Native bxCAN<br>+ 6x USART"]:::feat
+    end
+
+    R1 --> F1
+    R2 --> F2
+    R3 --> F3
+    R4 --> F4
+    R5 --> F5
+```
+
 1. **Hardware Floating-Point Unit (FPU):** Peak-Shaving involves heavy algorithm tracking (`float` math). Standard microcontrollers do this matrix math in software, which is agonizingly slow. The F407's Cortex-M4F core calculates floats natively in silicon in a single clock cycle.
 2. **Advanced Nested Vectored Interrupt Controller (NVIC):** We require absolute deterministic preemption. The ARM NVIC allows us to hardware-prioritize the CAN bus ISR *over* the Modbus DMA ISR, ensuring collisions are resolved mathematically by the silicon, not the RTOS.
 3. **Extensive DMA Streams:** The chip has two robust DMA controllers with 16 separate streams. We uniquely offload the Modbus UART to one stream and the SPI W5500 transfers to another, completely unburdening the CPU.
 4. **Massive 1MB Flash Storage:** This size allows us to perfectly split the memory map in half (Bank 1 / Bank 2) for our resilient dual-bank MCUboot OTA updates, without needing to solder a vulnerable external SPI flash chip.
+5. **Native Industrial Peripherals:** The chip has a built-in bxCAN controller (for direct J1939 battery communication) and 6 USARTs (for Modbus RS-485). Cheaper chips often lack CAN entirely, forcing an external MCP2515 SPI module that adds cost, PCB space, and failure points.
 
----
+### Why not a cheaper alternative?
+
+| Feature | **STM32F407** (Selected) | **STM32F103** (Cheaper) | **ESP32** (Popular) |
+| :--- | :--- | :--- | :--- |
+| **Core** | Cortex-M4F @ 168 MHz | Cortex-M3 @ 72 MHz | Xtensa LX6 @ 240 MHz |
+| **Hardware FPU** | ✅ Yes (single-cycle) | ❌ No (software emulation) | ✅ Yes |
+| **Flash** | 1 MB (internal) | 64–128 KB (too small for OTA) | 4 MB (external SPI — vulnerable) |
+| **CAN Bus** | ✅ Native bxCAN | ✅ Native bxCAN | ❌ None (needs MCP2515) |
+| **DMA Streams** | 16 streams | 7 channels (limited) | Limited, Wi-Fi contention |
+| **CCM RAM** | ✅ 64 KB (zero wait-state) | ❌ None | ❌ None |
+| **Industrial Cert** | ✅ AEC-Q100 qualified | ✅ Available | ❌ Consumer-grade |
+| **Price (~1K units)** | ~$6.00 | ~$2.50 | ~$3.00 |
+| **Verdict** | ✅ **Selected** | ❌ Flash too small, no FPU | ❌ No CAN, external Flash, not industrial |
+
+### External Transceiver Chips (Why the STM32 can't drive the bus directly)
+
+A very common interview question is: *"Can the STM32 talk directly to a CAN bus or RS-485 wire?"* The answer is **No.**
+
+The STM32F407's internal peripherals (bxCAN, USART, SPI) output standard **3.3V CMOS logic levels** (0V = LOW, 3.3V = HIGH) on their GPIO pins. Industrial buses use completely different electrical signaling:
+
+*   **CAN Bus** uses **differential signaling** (CAN-H and CAN-L wires). A logical `0` ("dominant") is CAN-H=3.5V & CAN-L=1.5V. A logical `1` ("recessive") is both wires at 2.5V. The STM32's GPIO pin physically cannot generate this.
+*   **RS-485** also uses **differential signaling** (A and B wires). The voltage can swing from -7V to +12V over hundreds of meters of copper cable. A 3.3V GPIO would be instantly destroyed.
+*   **Ethernet** requires a **PHY (Physical Layer)** chip and isolation magnetics to drive the 100BASE-TX twisted-pair signal at ±2.5V with Manchester encoding.
+
+Therefore, we use dedicated **external transceiver ICs** soldered between the STM32 and the physical copper:
+
+```mermaid
+flowchart LR
+    classDef mcu fill:#0f5e2d,stroke:#3ea662,stroke-width:2px,color:#fff
+    classDef xcvr fill:#8c5614,stroke:#d98d2b,stroke-width:2px,color:#fff
+    classDef bus fill:#1e1e1e,stroke:#00a3cc,stroke-width:2px,color:#fff
+
+    subgraph "STM32F407 (3.3V Logic)"
+        CAN_TX["PA12 CAN_TX<br>3.3V CMOS"]:::mcu
+        CAN_RX["PA11 CAN_RX<br>3.3V CMOS"]:::mcu
+        UART_TX["PA2 USART2_TX<br>3.3V CMOS"]:::mcu
+        UART_RX["PA3 USART2_RX<br>3.3V CMOS"]:::mcu
+        DE["PD4 DE Pin<br>Direction Control"]:::mcu
+        SPI_MOSI["SPI1 MOSI/MISO/SCK<br>3.3V CMOS"]:::mcu
+    end
+
+    subgraph "Transceiver ICs (Voltage Conversion)"
+        TJA["TJA1050<br>CAN Transceiver"]:::xcvr
+        MAX["MAX3485<br>RS-485 Transceiver"]:::xcvr
+        W5500["W5500 + RJ45 Magnetics<br>Ethernet PHY + TCP/IP"]:::xcvr
+    end
+
+    subgraph "Physical Copper Bus"
+        CANH["CAN-H / CAN-L<br>Differential ±2V"]:::bus
+        RS485["RS-485 A / B<br>Differential ±7V"]:::bus
+        ETH["RJ45 Cable<br>100BASE-TX"]:::bus
+    end
+
+    CAN_TX --> TJA
+    CAN_RX --> TJA
+    TJA <--> CANH
+
+    UART_TX --> MAX
+    UART_RX --> MAX
+    DE --> MAX
+    MAX <--> RS485
+
+    SPI_MOSI <--> W5500
+    W5500 <--> ETH
+```
+
+| Interface | STM32 Internal Peripheral | External Transceiver IC | What It Does | Approx. Cost |
+| :--- | :--- | :--- | :--- | :--- |
+| **CAN Bus** | `bxCAN` (built-in protocol engine) | **TJA1050** (NXP) | Converts 3.3V CAN_TX/RX logic to differential CAN-H/CAN-L voltages. Handles bus arbitration electrically. | ~$0.50 |
+| **RS-485 Modbus** | `USART2` (built-in UART) | **MAX3485** (Maxim) | Converts 3.3V UART TX/RX to differential RS-485 A/B. The `DE` pin controls half-duplex direction (transmit vs receive). | ~$0.60 |
+| **Ethernet** | `SPI1` (data bus only) | **W5500** (WIZnet) + RJ45 Jack with built-in magnetics | The W5500 is unique — it is not just a PHY. It contains a **full hardware TCP/IP stack** (MAC + PHY + IP + TCP + UDP) in silicon. The RJ45 jack includes galvanic isolation transformers to protect against ground loops. | ~$3.50 |
+
+> 💡 **Interview Key Point:** The STM32's `bxCAN` peripheral handles the **CAN protocol** (arbitration, bit stuffing, CRC, error frames) entirely in hardware. The TJA1050 only handles the **electrical signaling**. Without the TJA1050, the STM32 knows *what* to say but physically cannot *speak* on the bus.
 
 ## 14. Estimated Hardware & Bill of Materials (BOM) Cost
 
@@ -1661,32 +2082,231 @@ To bridge the gap between high-level C logic and physical STM32 hardware executi
 3.  **Assembler (`arm-none-eabi-as`):** Converts the ARM Assembly into physical machine code (1s and 0s). This outputs unlinked Object files (`.o`).
 4.  **Linker (`arm-none-eabi-ld`):** The most critical embedded step. The linker takes all the floating `.o` files, the FreeRTOS OS libraries, and the STM32 HAL libraries, and physically maps them to specific transistor addresses inside the STM32's memory based strictly on the **Linker Script (`STM32F407VGTX_FLASH.ld`)**. It produces the final executable `.elf` and `.bin` payloads.
 
+### Build Output Artifacts (What the toolchain produces)
+
+After a successful build, the GCC toolchain generates several output files. Each file serves a distinct purpose in the embedded workflow:
+
+| Output File | What It Contains | When You Use It | How To Inspect It |
+| :--- | :--- | :--- | :--- |
+| **`.elf`** | The complete executable with **all debug symbols**, function names, variable names, source file mappings, and section addresses. This is the "master" build output. | **Debugging only.** You load this into GDB / STM32CubeIDE for hardware breakpoints, step-through debugging, and live variable inspection. It is **never** flashed to production boards (too large, contains secrets). | `arm-none-eabi-readelf -h app.elf` (shows ELF header) | 
+| **`.bin`** | A **raw binary image** — pure machine code bytes with zero metadata, headers, or debug symbols. Byte 0 of the file maps directly to the first Flash address. | **Flashing & OTA.** This is the file you flash via `st-flash write app.bin 0x08040000` and the file you sign with `imgtool` for secure OTA. It is the **production deliverable.** | `arm-none-eabi-size app.elf` (shows .text/.data/.bss sizes) or `ls -lh app.bin` (shows raw file size in bytes) |
+| **`.hex`** | An Intel HEX formatted text file. Each line is a human-readable ASCII record containing the target address and the data bytes to write there. | **STM32CubeProgrammer GUI.** The GUI tool prefers `.hex` because it contains embedded address info — you don't need to manually type `0x08040000`. Also used by some factory programmers. | `head -5 app.hex` (shows the first 5 address records) |
+| **`.map`** | A detailed **linker map report**. Lists every single function, variable, and library — showing its exact memory address, size in bytes, and which `.o` file contributed it. | **Memory debugging & optimization.** If your binary is too large, open the `.map` file to find which function or library consumes the most Flash. Also confirms your linker script placed code at the correct addresses. | `grep -i "Task_Poll" app.map` (finds where Task_Poll lives in memory) |
+| **`.list`** | A **disassembly listing** — the final ARM assembly instructions alongside the original C source lines. | **Low-level debugging.** When you suspect the compiler generated incorrect code (e.g., FPU not being used), you check the `.list` to see the actual ARM instructions. | `arm-none-eabi-objdump -d app.elf > app.list` (generates the listing) |
+
+**Quick verification commands after every build:**
+```bash
+# 1. Check total Flash and RAM usage (most important command!)
+arm-none-eabi-size build/ems_rtos.elf
+#   text    data     bss     dec     hex filename
+#  68432    1204    9856   79492   13684 build/ems_rtos.elf
+#   ↑ Flash  ↑ Flash  ↑ RAM
+
+# 2. Verify the .bin file size fits in Bank 1 (must be < 384KB = 393216 bytes)
+ls -l build/ems_rtos.bin
+
+# 3. Confirm the Entry Point address matches our linker script (should be 0x08040xxx)
+arm-none-eabi-readelf -h build/ems_rtos.elf | grep "Entry point"
+
+# 4. Find the biggest functions consuming Flash (top 10)
+arm-none-eabi-nm --size-sort --reverse-sort build/ems_rtos.elf | head -10
+```
+
 ### Linker Script & Memory Partitioning Modifications
 In a standard bare-metal project, the Linker Script instructs the CPU to place the main application right at the beginning of Flash memory (`0x08000000`). However, because we integrated **MCUboot (The Bootloader)**, we had to fundamentally rewrite the Linker Script and memory management logic.
 
-*   **Standard Linker (Unused):** `FLASH_APP_START = 0x08000000;`
-*   **Our Modified Linker:** `FLASH_APP_START = 0x08040000;`
+#### Standard Project (No Bootloader) vs. Our Project (With MCUboot)
 
-**Modified Linker Script Snippet (`STM32F407VGTX_FLASH.ld`):**
+In a **standard** STM32 project (no bootloader), you compile *one single `.elf` file* which the linker places directly at `0x08000000`. The CPU resets, reads the vector table from `0x08000000`, and directly executes your application. Simple.
+
+In **our project**, we have **two completely separate firmware projects**, each compiled independently into its own `.elf` and `.bin`:
+
+| Binary | Source Project | Linker Origin | Flashed To | Contains |
+| :--- | :--- | :--- | :--- | :--- |
+| **`mcuboot.bin`** | MCUboot (separate C project) | `0x08000000` | `st-flash write mcuboot.bin 0x08000000` | Bootloader code + embedded ECDSA public key |
+| **`ems_rtos_signed.bin`** | ems-mini-rtos (our project) | `0x08040000` | `st-flash write ems_rtos_signed.bin 0x08040000` | FreeRTOS application + signed image header |
+
+They are **never combined into a single `.elf`**. Each has its own linker script pointing to a different Flash origin. At the factory, they are flashed sequentially as two separate `st-flash write` commands.
+
+```
+ Flash Memory Map (1MB = 0x08000000 to 0x080FFFFF)
+ ═══════════════════════════════════════════════════════════════════
+ 
+ ┌─────────────────────────────────────────┐ 0x08000000
+ │  mcuboot.bin (Bootloader)               │  ← Separate project, separate .elf
+ │  - Own vector table at 0x08000000       │     Flashed FIRST at the factory
+ │  - ECDSA P-256 public key embedded      │     st-flash write mcuboot.bin 0x08000000
+ │  - OTA swap engine + scratch logic      │
+ │  ~45 KB used out of 64 KB allocated     │
+ ├─────────────────────────────────────────┤ 0x08010000
+ │  (Unused padding to align sectors)      │
+ ├─────────────────────────────────────────┤ 0x08020000
+ │  Scratch / Swap Sector                  │  ← MCUboot uses this for partition swaps
+ │  128 KB reserved                        │
+ ├═════════════════════════════════════════┤ 0x08040000  ← OUR APP STARTS HERE
+ │  ems_rtos_signed.bin (FreeRTOS App)     │  ← Separate project, separate .elf
+ │  - Own vector table at 0x08040000       │     Flashed SECOND at the factory
+ │  - FreeRTOS kernel + all tasks          │     st-flash write ems_rtos_signed.bin 0x08040000
+ │  - HAL drivers, W5500, MQTT             │
+ │  ~70 KB used out of 384 KB allocated    │
+ │  BANK 1 (Active Application Slot)       │
+ ├─────────────────────────────────────────┤ 0x080A0000
+ │  BANK 2 (OTA Download Slot)             │  ← Incoming firmware lands here via OTA
+ │  384 KB (mirror of Bank 1)              │
+ └─────────────────────────────────────────┘ 0x080FFFFF
+```
+
+**Our Modified Linker Script (`STM32F407VGTX_FLASH.ld`):**
 ```text
 MEMORY
 {
   CCMRAM (xrw)     : ORIGIN = 0x10000000, LENGTH = 64K
   RAM (xrw)        : ORIGIN = 0x20000000, LENGTH = 128K
-  /* Bootloader is 0x0800 0000 to 0x0803 FFFF */
+  /* Bootloader is 0x0800 0000 to 0x0803 FFFF (its own binary) */
   FLASH (rx)       : ORIGIN = 0x08040000, LENGTH = 384K /* Bank 1 App Slot */
 }
 ```
 
 We physically pushed the starting address of `ems-rtos-mini` 256KB deep into the memory map (`0x08040000`), reserving the foundational blocks purely for the Bootloader and its Cryptographic Swap / Scratch routines. 
 
-We also had to shift the **Vector Table Offset Register (VTOR)** inside `system_stm32f4xx.c`. If we didn't tell the ARM Cortex core that its interrupt vector table moved to `0x08040000`, the moment a hardware timer fired, the CPU would look in the wrong place, executing garbage bootloader memory, and instantly crash into a Hard Fault.
+#### The VTOR Shift (Critical: Why and How)
+
+We also had to shift the **Vector Table Offset Register (VTOR)** inside `system_stm32f4xx.c`.
+
+**What is the Vector Table?**
+The very first 4 bytes at the beginning of any ARM Cortex-M binary is the Initial Stack Pointer. The next 4 bytes is the Reset Handler address. After that comes a table of function pointers — one for every possible hardware interrupt (SysTick, UART, CAN, DMA, etc.). When the CPU receives any hardware interrupt, it looks up the handler address **from the vector table** and jumps to it.
+
+**The Problem:**
+After MCUboot finishes verification and jumps to `0x08040000`, the ARM core's VTOR register still points to `0x08000000` (the bootloader's vector table). So when the FreeRTOS `SysTick` timer fires 1ms later, the CPU looks up the SysTick handler at address `0x08000000 + offset`, which is a **bootloader function** — not our FreeRTOS handler. The CPU jumps to random MCUboot code, and instantly crashes into a **Hard Fault**.
+
+**The Fix — Exact Code Change in `system_stm32f4xx.c`:**
+```c
+// ──── File: Core/Src/system_stm32f4xx.c ────
+
+// Step 1: Enable the custom VTOR address (uncomment this #define)
+#define USER_VECT_TAB_ADDRESS    // ← This was commented out by default!
+
+// Step 2: Set the offset to match our linker script origin
+#ifdef USER_VECT_TAB_ADDRESS
+  #define VECT_TAB_OFFSET  0x00040000U   // ← Changed from 0x00000000 to 0x00040000
+#endif                                   //    This is 256KB = the gap for MCUboot
+
+// Step 3: SystemInit() applies the shift at boot (called before main())
+void SystemInit(void)
+{
+  /* FPU settings ───────────────────────────────────── */
+  #if (__FPU_PRESENT == 1) && (__FPU_USED == 1)
+    SCB->CPACR |= ((3UL << 20U) | (3UL << 22U)); // Enable FPU
+  #endif
+
+  /* Vector Table Relocation ─────────────────────────── */
+  #ifdef USER_VECT_TAB_ADDRESS
+    SCB->VTOR = FLASH_BASE | VECT_TAB_OFFSET;
+    // ↑ This single line is the magic.
+    // FLASH_BASE = 0x08000000 (defined by CMSIS)
+    // VECT_TAB_OFFSET = 0x00040000 (our #define above)
+    // Result: SCB->VTOR = 0x08040000
+    // Now when SysTick fires, the CPU looks at 0x08040000 + SysTick_offset
+    // which is OUR FreeRTOS handler, not the bootloader's!
+  #endif
+}
+```
+
+**Before vs. After the VTOR shift:**
+
+| Event | VTOR = `0x08000000` (DEFAULT / BROKEN) | VTOR = `0x08040000` (OUR FIX) |
+| :--- | :--- | :--- |
+| SysTick fires (1ms) | CPU reads handler from MCUboot memory → **Hard Fault** | CPU reads handler from FreeRTOS app → ✅ Scheduler runs |
+| UART ISR fires | CPU jumps to bootloader code → **Crash** | CPU jumps to our DMA callback → ✅ Modbus works |
+| CAN RX ISR fires | CPU reads garbage → **Crash** | CPU reads `HAL_CAN_RxFifo0MsgPendingCallback` → ✅ Battery data arrives |
+
+#### The Vector Table: What It Looks Like in Memory
+
+The vector table lives at the very beginning of our application binary (`0x08040000`). It is defined in the startup assembly file `startup_stm32f407xx.s` and looks like this in memory:
+
+```
+ Vector Table at 0x08040000 (Our Application)
+ ═══════════════════════════════════════════════════
+ Offset    │ Contents                       │ Purpose
+ ──────────┼────────────────────────────────┼──────────────────────
+ +0x000    │ 0x20020000                     │ Initial Stack Pointer (top of RAM)
+ +0x004    │ Reset_Handler address          │ CPU jumps here on power-on
+ +0x008    │ NMI_Handler address            │ Non-Maskable Interrupt
+ +0x00C    │ HardFault_Handler address      │ Catches all fatal crashes
+ +0x010    │ MemManage_Handler              │ Memory protection fault
+ +0x014    │ BusFault_Handler               │ Bus access error
+ +0x018    │ UsageFault_Handler             │ Undefined instruction
+ ...       │ ...                            │ ...
+ +0x03C    │ SysTick_Handler address        │ ← FreeRTOS uses THIS for scheduling!
+ ...       │ ...                            │ ...
+ +0x0D8    │ USART2_IRQHandler address      │ ← Our Modbus DMA IDLE callback
+ +0x100    │ CAN1_RX0_IRQHandler address    │ ← Our CAN mailbox ISR
+ ...       │ (up to 82 interrupt entries)   │ ...
+```
+
+When the CPU receives interrupt #15 (SysTick), it reads address `SCB->VTOR + 0x03C`, fetches the function pointer stored there, and **jumps to it**. This is why shifting VTOR is critical — it tells the CPU *which copy* of the vector table to use.
+
+#### How Task Switching Actually Works (The Full Flow)
+
+This is one of the most commonly asked interview questions. Here is the **exact sequence** of what happens inside the ARM Cortex-M4 and FreeRTOS kernel when a context switch occurs:
+
+```mermaid
+sequenceDiagram
+    participant HW as ARM Cortex-M4 Hardware
+    participant NVIC as NVIC (Interrupt Controller)
+    participant SysTick as SysTick_Handler (ISR)
+    participant PendSV as PendSV_Handler (ISR)
+    participant Sched as FreeRTOS Scheduler
+    participant TaskA as Task_Net (Running)
+    participant TaskB as Task_Poll (Ready)
+
+    Note over TaskA: Task_Net is currently executing<br>MQTT publish code...
+
+    HW->>NVIC: ① SysTick counter hits 0<br>(every 1ms)
+    NVIC->>SysTick: ② CPU auto-saves R0-R3,R12,LR,PC,xPSR<br>to Task_Net's stack (hardware frame)
+    SysTick->>Sched: ③ Calls xTaskIncrementTick()
+    Sched->>Sched: ④ Checks: Is Task_Poll's<br>osDelay(300) expired?<br>YES → Move to Ready list
+    Sched->>Sched: ⑤ Task_Poll priority (48) ><br>Task_Net priority (24).<br>Context switch needed!
+    Sched->>NVIC: ⑥ Sets PendSV bit<br>(triggers lowest-priority ISR)
+    SysTick->>HW: ⑦ SysTick ISR returns
+
+    NVIC->>PendSV: ⑧ PendSV fires (deferred switch)
+    PendSV->>TaskA: ⑨ Manually saves R4-R11<br>to Task_Net's stack (software frame)
+    PendSV->>Sched: ⑩ Calls vTaskSwitchContext()
+    Sched->>Sched: ⑪ Updates pxCurrentTCB<br>pointer → Task_Poll
+    PendSV->>TaskB: ⑫ Restores R4-R11<br>from Task_Poll's stack
+    PendSV->>HW: ⑬ Returns from ISR
+    HW->>TaskB: ⑭ Hardware auto-restores<br>R0-R3,R12,LR,PC,xPSR<br>from Task_Poll's stack
+    Note over TaskB: Task_Poll resumes EXACTLY<br>where it left off last time!
+```
+
+**Step-by-step breakdown:**
+
+| Step | Who Does It | What Happens | CPU Cycles |
+| :--- | :--- | :--- | :--- |
+| **①** | Hardware (SysTick timer) | The SysTick counter register decrements to 0. It fires every 1ms. | 0 (hardware) |
+| **②** | ARM Cortex Hardware (automatic) | The CPU **automatically** pushes 8 registers (`R0, R1, R2, R3, R12, LR, PC, xPSR`) from `Task_Net` onto `Task_Net`'s own stack. This is called the **hardware exception frame**. You do NOT write code for this — the silicon does it. | ~12 cycles |
+| **③** | `SysTick_Handler` (FreeRTOS ISR) | FreeRTOS increments its internal tick counter and checks all delayed tasks. | ~20 cycles |
+| **④–⑤** | FreeRTOS Scheduler | The scheduler evaluates the Ready list. `Task_Poll` (priority 48) is higher than `Task_Net` (priority 24). A switch is needed. | ~30 cycles |
+| **⑥** | FreeRTOS Scheduler | Instead of switching immediately (which is unsafe inside SysTick), it sets the **PendSV** interrupt pending bit. PendSV is configured as the **lowest priority** interrupt, so it fires only after all other ISRs complete. | 1 cycle |
+| **⑦** | Hardware | SysTick ISR returns. Hardware restores the basic frame — but PendSV is pending! | ~12 cycles |
+| **⑧** | ARM Cortex Hardware | PendSV fires immediately (nothing else is pending). | ~12 cycles |
+| **⑨** | `PendSV_Handler` (FreeRTOS, written in assembly) | **Manually** saves the remaining 8 registers (`R4–R11`) that the hardware did NOT save. These are pushed onto `Task_Net`'s stack. Now `Task_Net`'s **complete CPU state** is frozen on its stack. | ~8 cycles |
+| **⑩–⑪** | FreeRTOS `vTaskSwitchContext()` | Updates the global `pxCurrentTCB` pointer to point at `Task_Poll`'s Task Control Block. | ~10 cycles |
+| **⑫** | `PendSV_Handler` | **Manually** restores `R4–R11` from `Task_Poll`'s stack (where they were saved last time `Task_Poll` was suspended). | ~8 cycles |
+| **⑬–⑭** | ARM Cortex Hardware | PendSV returns. Hardware **automatically** pops `R0–R3, R12, LR, PC, xPSR` from `Task_Poll`'s stack. The PC register now points to the exact instruction where `Task_Poll` was paused last time. | ~12 cycles |
+
+**Total context switch time: ~125 CPU cycles ≈ 0.75 microseconds at 168 MHz.**
+
+> 💡 **Key Interview Point:** The context switch uses **two ISRs** — `SysTick` (high priority, just makes the decision) and `PendSV` (lowest priority, does the actual register swap). The reason for this split is that if a CAN or UART ISR fires at the same time as SysTick, the higher-priority hardware ISR runs first. PendSV patiently waits and only performs the switch when the CPU is completely idle from all hardware servicing.
 
 ---
 
 ## 16. The System Boot Flow & Timings
 
-When power is dynamically applied to the 24V bus from the battery racks, the board does not instantly start running the FreeRTOS controller. It undergoes a rigid, multi-stage boot sequence designed for maximum industrial safety.
+When power is applied to the industrial **24V DC bus** from the battery racks, an onboard **DC-DC buck converter** steps the voltage down to a clean **3.3V rail** that feeds the STM32 and all 3.3V logic. The STM32 itself never sees 24V — it operates entirely on 3.3V. However, from a system perspective, the "power-on" event is the 24V bus energizing. The board does not instantly start running the FreeRTOS controller. It undergoes a rigid, multi-stage boot sequence designed for maximum industrial safety.
+
+> 💡 **Power chain:** `24V DC (Battery/PSU)` → `DC-DC Buck (e.g., LM2596)` → `3.3V Rail` → `STM32 VDD pins`
 
 ### Boot Chain Comparison: RTOS vs Embedded Linux
 
@@ -1786,9 +2406,171 @@ To understand this boot flow, it helps to compare it directly against the Embedd
     }
     ```
     Once the core kernel vectors are shifted, it evaluates the `SystemClock_Config()` function to fire up the external 8MHz Crystal Oscillator (HSE), feeding it through the PLL to aggressively multiply the core clock to exactly **168 MHz**.
+
+### ⏰ Clock Tree & PLL Configuration (Deep Dive)
+
+This is a **top-tier interview topic**. Every STM32 project must configure its clock tree, and getting it wrong means all peripherals (UART, SPI, CAN, timers) run at wrong speeds and silently produce garbage data.
+
+#### The Clock Path (How 8 MHz Becomes 168 MHz)
+
+```
+ Clock Source Selection & PLL Multiplication
+ ══════════════════════════════════════════════════════════════════
+
+ ┌───────────────┐     ┌─────────────┐     ┌──────────────────┐
+ │ HSE Crystal   │     │ PLL Engine  │     │ System Clock     │
+ │ (External)    │────→│             │────→│ SYSCLK = 168 MHz │
+ │ 8 MHz         │  ÷M │  ×N   ÷P   │     │                  │
+ └───────────────┘     └─────────────┘     └────────┬─────────┘
+                                                    │
+                        ┌───────────────────────────┼──────────────────────┐
+                        │                           │                      │
+                        ▼                           ▼                      ▼
+               ┌────────────────┐          ┌────────────────┐     ┌────────────────┐
+               │ AHB Bus        │          │ APB1 Bus       │     │ APB2 Bus       │
+               │ 168 MHz        │          │ 42 MHz (÷4)   │     │ 84 MHz (÷2)   │
+               │ (Core + DMA)   │          │ (UART, I2C,   │     │ (SPI1, ADC,   │
+               │                │          │  CAN, Timers)  │     │  USART1)       │
+               └────────────────┘          └────────────────┘     └────────────────┘
+```
+
+#### The Exact PLL Math
+
+The STM32F407's PLL takes the input clock and applies three dividers:
+
+```
+SYSCLK = (HSE / PLL_M) × PLL_N / PLL_P
+       = (8 MHz / 8)    × 336   / 2
+       = 1 MHz           × 336   / 2
+       = 168 MHz  ✅
+```
+
+| PLL Parameter | Value | Purpose |
+| :--- | :--- | :--- |
+| `PLL_M` | 8 | Divides HSE down to exactly 1 MHz (PLL input requirement: 1–2 MHz) |
+| `PLL_N` | 336 | Multiplies 1 MHz up to 336 MHz (VCO output) |
+| `PLL_P` | 2 | Divides VCO output to get final SYSCLK: 336 / 2 = 168 MHz |
+| `PLL_Q` | 7 | Separate divider for USB OTG: 336 / 7 = 48 MHz (USB requires exactly 48 MHz) |
+
+#### SystemClock_Config() Code
+
+```c
+// ──── File: Core/Src/main.c ────
+void SystemClock_Config(void) {
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    // Step 1: Enable HSE (External 8 MHz crystal on pins PH0/PH1)
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;  // ← Use crystal, not RC
+    RCC_OscInitStruct.PLL.PLLM = 8;    // 8 MHz ÷ 8 = 1 MHz
+    RCC_OscInitStruct.PLL.PLLN = 336;  // 1 MHz × 336 = 336 MHz (VCO)
+    RCC_OscInitStruct.PLL.PLLP = 2;    // 336 MHz ÷ 2 = 168 MHz (SYSCLK!)
+    RCC_OscInitStruct.PLL.PLLQ = 7;    // 336 MHz ÷ 7 = 48 MHz (USB)
+    HAL_RCC_OscConfig(&RCC_OscInitStruct);
+
+    // Step 2: Set bus dividers (AHB, APB1, APB2)
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK
+                                | RCC_CLOCKTYPE_PCLK1  | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;    // 168 MHz
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;     // 168 ÷ 4 = 42 MHz
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;     // 168 ÷ 2 = 84 MHz
+
+    // Step 3: Flash latency MUST match clock speed!
+    HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5);
+    //                                      ↑ 5 wait states for 168 MHz
+}
+```
+
+#### 🎯 Interview-Level Clock Tree Notes
+
+| Question | Answer |
+| :--- | :--- |
+| **Why HSE instead of HSI (internal 16 MHz RC)?** | The internal RC oscillator drifts ±1% with temperature. CAN bus at 500 kbps requires ≤0.5% accuracy — HSI would cause random CAN bit errors in hot industrial environments. The external crystal is ±20 ppm (0.002%). |
+| **What are Flash wait states?** | The Flash memory chip inside the STM32 is physically slower than the CPU. At 168 MHz, the CPU can request an instruction every ~6ns, but Flash needs ~30ns to respond. Setting `FLASH_LATENCY_5` tells the CPU to insert 5 wait cycles per fetch. If you set this too low, the CPU reads garbage from Flash and Hard Faults. |
+| **What happens if the HSE crystal physically breaks?** | The STM32 has a **Clock Security System (CSS)**. If HSE fails, CSS automatically switches SYSCLK to the internal HSI (16 MHz) and fires an NMI interrupt. The system keeps running at reduced speed rather than crashing. We handle this in `NMI_Handler()` to log the fault and set the red LED. |
+| **Why is APB1 limited to 42 MHz?** | It's a physical silicon limitation documented in the STM32F407 datasheet. The APB1 bus transistors cannot switch reliably above 42 MHz. The CAN peripheral is on APB1 — its baud rate prescaler is calculated from this 42 MHz base clock. |
+| **How does SPI1 get 21 Mbit/s for W5500?** | SPI1 is on APB2 (84 MHz). We set the SPI prescaler to `DIV4`: 84 ÷ 4 = 21 MHz. This is the maximum speed the W5500 chip supports. |
+
 4.  **C Runtime Initialization (`+155 ms`):** The C-language `_start()` routine copies all global variable initializations (`.data` section) slowly from Flash ROM into volatile RAM. 
 5.  **FreeRTOS Kernel Launch (`+160 ms`):** `main()` completes creating the 3 Queues, 3 Tasks, and Semaphores, and finally calls `osKernelStart()`. The FreeRTOS preemptive scheduler takes over the CPU entirely.
 6.  **Application Running (`+300 ms`):** Within roughly 1/3 of a second of bare-metal power-on, `Task_Poll` executes its first deterministic Modbus DMA read from the Grid Meter.
+
+### 📏 How To Measure Boot Timing Per Phase
+
+To **prove** these boot timing numbers (critical for certification and interviews), we use two methods:
+
+**Method 1: GPIO Toggle + Logic Analyzer (Most Accurate)**
+We add a single `HAL_GPIO_TogglePin()` call at the entry point of each boot phase. By probing these pins with a Saleae Logic Analyzer, we get **nanosecond-accurate** timestamps for each phase transition:
+```c
+// Inside MCUboot's main() — fires at +5ms
+HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_SET);   // Green LED ON
+
+// Inside SystemInit() — fires at +151ms
+HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, GPIO_PIN_SET);   // Orange LED ON
+
+// Inside main() after osKernelStart() — fires at +160ms
+HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);   // Red LED ON
+
+// Inside Task_Poll first loop — fires at +300ms
+HAL_GPIO_WritePin(GPIOD, GPIO_PIN_15, GPIO_PIN_SET);   // Blue LED ON
+```
+The logic analyzer captures exact rising-edge timestamps, proving boot time to auditors.
+
+**Method 2: SEGGER SystemView (Software Trace)**
+After `osKernelStart()`, SystemView records all task switches with microsecond resolution. It visually proves the first `Task_Poll` execution time.
+
+### 🔧 How To Debug the Bootloader (MCUboot) at Runtime
+
+Debugging MCUboot is tricky because it is a **separate project** with its own `.elf`. Here are the methods:
+
+**Method 1: SWD Hardware Debugging (Before RDP is set)**
+Before the factory locks the board with RDP Level 2, you can connect an ST-LINK and debug MCUboot directly:
+```bash
+# Load MCUboot's .elf (with debug symbols) into GDB
+arm-none-eabi-gdb build/mcuboot.elf
+(gdb) target remote :3333
+(gdb) monitor reset halt          # Freeze CPU at address 0x08000000
+(gdb) break main                  # Set breakpoint at MCUboot's main()
+(gdb) continue                    # Run until breakpoint
+(gdb) step                        # Step through signature verification
+(gdb) print image_ok              # Inspect the OTA flag value
+```
+
+**Method 2: UART Serial Console (Always Available)**
+MCUboot is compiled with `MCUBOOT_LOG_LEVEL=4` (DEBUG). It prints detailed logs over UART at 115200 baud:
+```
+[INF] MCUboot v1.9.0 starting
+[INF] Primary image: magic=good, swap_type=none, copy_done=0x1, image_ok=0x1
+[INF] Verifying signature with ECDSA-P256...
+[INF] Signature OK! Booting primary slot (0x08040000)...
+```
+If signature verification fails, you see:
+```
+[ERR] Image in primary slot is not valid!
+[ERR] Unable to find bootable image
+```
+
+**Method 3: Fault Pin Indication**
+In production (RDP Level 2, no SWD), we configure MCUboot to toggle a dedicated GPIO if it fails to boot. The factory test rig checks this pin.
+
+### ⚠️ Boot Error Troubleshooting Table
+
+| Symptom | Root Cause | How To Diagnose | How To Fix |
+| :--- | :--- | :--- | :--- |
+| **Board is completely dead** (no LEDs, no UART) | DC-DC converter failure or BOR reset holding CPU | Check 3.3V rail with a multimeter. If below 2.7V, BOR is active. | Replace DC-DC module. Verify 24V input is stable. |
+| **MCUboot prints nothing on UART** | VTOR is correct but MCUboot binary is corrupted or missing | Connect ST-LINK, run `arm-none-eabi-gdb`, check if PC is stuck at `0xFFFFFFFE` (HardFault). | Re-flash `mcuboot.bin` at `0x08000000`. |
+| **`Signature INVALID! Halting.`** | Wrong signing key used by CI/CD, or binary was corrupted during transfer | Check `imgtool` command in CI pipeline. Verify the public key embedded in MCUboot matches the private key used to sign. | Re-sign the app binary with the correct `.pem` key. Re-flash. |
+| **`Unable to find bootable image`** | Application binary missing from Bank 1, or MCUboot image header is absent | Verify `ems_rtos_signed.bin` was flashed to `0x08040000`. Check with `st-flash read dump.bin 0x08040000 0x100` and inspect the MCUboot header bytes. | Re-flash the signed application binary. |
+| **MCUboot boots, app crashes immediately** (Hard Fault within 1ms) | VTOR not shifted — SysTick ISR jumps to bootloader memory | Connect GDB, `monitor reset halt`, check `SCB->VTOR` value. If `0x08000000`, the shift is missing. | Uncomment `#define USER_VECT_TAB_ADDRESS` and set `VECT_TAB_OFFSET = 0x00040000U` in `system_stm32f4xx.c`. |
+| **MCUboot boots, app crashes after ~2 seconds** | IWDG watchdog not being refreshed — `Task_Poll` is stuck | Check UART logs. If last message is from `main()` but no task output, a queue or semaphore creation failed (out of RAM). | Increase `configTOTAL_HEAP_SIZE` in `FreeRTOSConfig.h`. Use `arm-none-eabi-size` to check RAM usage. |
+| **App runs but FreeRTOS scheduler never starts** | `osKernelStart()` returns an error (not enough heap for Idle Task) | GDB: set breakpoint at `osKernelStart`, step through. Check return value. | Ensure heap is at least 4KB larger than all task stacks combined. |
+| **App runs but Modbus never responds** | SysTick works but UART DMA ISR goes to wrong handler (partial VTOR issue — rare) | Use Logic Analyzer to check UART TX/RX pins for any signal. Check `USART2->SR` register in GDB for overrun errors. | Verify the startup assembly file (`startup_stm32f407xx.s`) includes the correct ISR vector names matching the HAL callbacks. |
+| **Board randomly resets every 3 seconds** | IWDG is enabled in MCUboot but the application never calls `HAL_IWDG_Refresh()` | Check if MCUboot enables IWDG in its `main.c`. Once enabled in hardware, IWDG **cannot be disabled** — only refreshed. | Ensure `Task_Poll` calls `HAL_IWDG_Refresh()` inside its main loop. The IWDG prescaler must allow enough time for boot. |
+| **OTA swap takes forever and board resets mid-swap** | IWDG timeout is shorter than the Flash erase + swap duration | Calculate worst-case swap time: `(384KB / 4KB chunks) × erase_time_per_sector`. If > IWDG timeout, it resets. | Increase IWDG prescaler or call `HAL_IWDG_Refresh()` inside MCUboot's swap loop between each 4KB chunk. |
 
 ---
 
@@ -1852,6 +2634,122 @@ graph TD
     INV <==>|Differential RS485-A/B| RS485
     ETH <==>|TCP/IP Over RJ45 Isolator| AWS
 ```
+
+### Physical Wiring: CAN Bus & RS-485 Connections
+
+A common interview question is: *"How many wires does CAN bus actually need? What about RS-485?"* Here is the exact physical wiring used in our project:
+
+#### CAN Bus Wiring (To BMS Battery Rack)
+
+CAN bus uses **2 signal wires + 1 ground** (3 wires total):
+
+```
+ STM32 Board                             Battery BMS Module
+ ┌────────────────┐       Twisted-Pair    ┌──────────────────┐
+ │                │       Cable           │                  │
+ │  TJA1050       │                       │  CAN Transceiver │
+ │  ┌──────────┐  │                       │  ┌──────────┐    │
+ │  │  CAN-H ──┼──┼── Yellow Wire ────────┼──┤  CAN-H   │    │
+ │  │  CAN-L ──┼──┼── Green Wire  ────────┼──┤  CAN-L   │    │
+ │  │  GND   ──┼──┼── Black Wire  ────────┼──┤  GND     │    │
+ │  └──────────┘  │                       │  └──────────┘    │
+ │                │                       │                  │
+ │  120Ω Resistor │                       │  120Ω Resistor   │
+ │  (CAN-H↔CAN-L)│                       │  (CAN-H↔CAN-L)  │
+ └────────────────┘                       └──────────────────┘
+```
+
+| Wire | Name | Voltage Range | Purpose |
+| :--- | :--- | :--- | :--- |
+| **Wire 1** | `CAN-H` (CAN High) | 2.5V – 3.5V | Dominant = 3.5V, Recessive = 2.5V |
+| **Wire 2** | `CAN-L` (CAN Low) | 1.5V – 2.5V | Dominant = 1.5V, Recessive = 2.5V |
+| **Wire 3** | `GND` (Signal Ground) | 0V | Common reference. Required to prevent ground-loop noise between boards |
+
+> 💡 **Termination:** Both ends of the CAN bus **must** have a **120Ω resistor** soldered between CAN-H and CAN-L. Without these, signal reflections on the copper wire corrupt bits at 500 kbps. In our project, the STM32 PCB has one 120Ω, and the battery BMS has the other. You can verify correct termination by measuring resistance between CAN-H and CAN-L with a multimeter — it should read **60Ω** (two 120Ω in parallel).
+
+#### RS-485 Wiring (To Grid Meter & Inverter)
+
+RS-485 Modbus uses **2 signal wires + 1 ground** (3 wires total). It is **half-duplex** — only one device can talk at a time:
+
+```
+ STM32 Board                             Grid Meter / Inverter
+ ┌────────────────┐       Twisted-Pair    ┌──────────────────┐
+ │                │       Cable (up to    │                  │
+ │  MAX3485       │       1200 meters!)   │  RS-485 Port     │
+ │  ┌──────────┐  │                       │  ┌──────────┐    │
+ │  │   A    ──┼──┼── Blue Wire  ─────────┼──┤   A      │    │
+ │  │   B    ──┼──┼── White Wire ─────────┼──┤   B      │    │
+ │  │  GND   ──┼──┼── Black Wire ─────────┼──┤  GND     │    │
+ │  └──────────┘  │                       │  └──────────┘    │
+ │   DE Pin ← PD4 │                       │                  │
+ │  (Direction     │                       │  120Ω Resistor   │
+ │   Control)      │                       │  (A ↔ B)         │
+ └────────────────┘                       └──────────────────┘
+```
+
+| Wire | Name | Voltage Range | Purpose |
+| :--- | :--- | :--- | :--- |
+| **Wire 1** | `A` (Non-inverting / D+) | -7V to +12V | Data+ line. Voltage difference (A-B) > +200mV = Logic `1` |
+| **Wire 2** | `B` (Inverting / D-) | -7V to +12V | Data- line. Voltage difference (A-B) < -200mV = Logic `0` |
+| **Wire 3** | `GND` (Signal Ground) | 0V | Common ground reference between distant devices |
+
+> ⚠️ **Half-Duplex Direction Control:** The MAX3485's `DE` (Driver Enable) pin is wired to STM32 GPIO `PD4`. When `DE=HIGH`, the MAX3485 **transmits** (drives A/B lines). When `DE=LOW`, it **listens** (receives data from A/B). This pin must be toggled precisely between TX and RX — see Challenge 1 in Section 18 for how we solved the timing jitter bug.
+
+#### Ethernet Wiring (To Cloud via RJ45)
+
+Ethernet uses **4 signal wires (2 twisted pairs) + shield** inside a standard Cat5/Cat5e cable with an RJ45 connector:
+
+| Pin | Wire Color (T568B) | Signal | Purpose |
+| :--- | :--- | :--- | :--- |
+| Pin 1 | Orange/White | `TX+` | Transmit positive |
+| Pin 2 | Orange | `TX-` | Transmit negative |
+| Pin 3 | Green/White | `RX+` | Receive positive |
+| Pin 6 | Green | `RX-` | Receive negative |
+| Pins 4,5,7,8 | — | Unused | (Used in Gigabit; unused in 100BASE-TX) |
+
+> 💡 **Galvanic Isolation:** The RJ45 jack on our PCB has built-in **magnetics transformers** that electrically isolate the STM32 board from the Ethernet cable. This prevents ground loops and voltage spikes from traveling through the cable and damaging the MCU — critical in industrial environments where motors and inverters generate massive EMI.
+
+#### Quick Summary
+
+| Bus | Total Wires | Signal Wires | Duplex | Max Distance | Speed |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **CAN** | 3 (CAN-H, CAN-L, GND) | 2 differential | Full (simultaneous TX/RX via arbitration) | 40m @ 1Mbps, 1000m @ 50kbps | 500 kbps |
+| **RS-485** | 3 (A, B, GND) | 2 differential | Half (TX or RX, not both) | **1200 meters** | 9600 baud |
+| **Ethernet** | 4 signal + shield | 2 twisted pairs | Full | 100 meters | 100 Mbps |
+
+### Board GPIO: LEDs, Reset, Diagnostic & Control Pins
+
+Beyond communication buses, the PCB uses several GPIO pins for visual feedback, hardware resets, and user interaction. On the STM32F407G-DISC1 development board, the four onboard LEDs (PD12–PD15) are used directly. On the production PCB, these are routed to panel-mount LEDs visible through the enclosure.
+
+#### LED Indicators
+
+| GPIO Pin | LED Color | Direction | Firmware Usage |
+| :--- | :--- | :--- | :--- |
+| `PD12` | 🟢 Green | Output (Push-Pull) | **System Alive** — Toggled every 300ms inside `Task_Poll`'s main loop. If this LED stops blinking, the RTOS has crashed or the IWDG has frozen. |
+| `PD13` | 🟠 Orange | Output (Push-Pull) | **Network Activity** — Lit solid when `Task_Net` has an active MQTT connection to AWS. Blinks rapidly during MQTT publish. OFF = no cloud link. |
+| `PD14` | 🔴 Red | Output (Push-Pull) | **Fault / Error** — Lit when an unrecoverable error occurs (e.g., CAN bus off, Modbus slave not responding for >10 cycles, Flash signature verification fail). Also lit during OTA update in progress. |
+| `PD15` | 🔵 Blue | Output (Push-Pull) | **Boot Phase Indicator** — Briefly lit during `SystemInit()` to confirm MCUboot handoff succeeded. Also used for boot timing measurement with logic analyzer. |
+
+#### Reset & Control Pins
+
+| GPIO Pin | Name | Direction | Purpose |
+| :--- | :--- | :--- | :--- |
+| `NRST` | **Hardware Reset** (active-LOW) | Input | Physical reset pin on the STM32. Directly connected to a tactile push-button on the PCB and to the ST-LINK debug probe. Pulling this LOW forces an immediate silicon reset — equivalent to a full power cycle. The IWDG watchdog internally triggers this pin when it expires. |
+| `PB0` | **W5500 Hardware Reset** | Output (Push-Pull) | Connected to the W5500 Ethernet chip's `RST` pin. `Task_Net` pulses this LOW for 2ms to force a full hardware reset of the Ethernet chip when a ghost TCP connection is detected (see Challenge 4 in Section 18). |
+| `PD4` | **RS-485 DE (Direction Enable)** | Output (Push-Pull) | Controls the MAX3485 half-duplex direction. `HIGH` = transmit, `LOW` = receive. Toggled by the hardware `HAL_UART_TxCpltCallback()` ISR to avoid timing jitter (see Challenge 1 in Section 18). |
+| `PA0` | **User Button (B1)** | Input (Pull-Down) | On the DISC1 dev board, this is the blue user push-button. In firmware, pressing this during boot forces MCUboot to roll back to the previous firmware bank (recovery mode). In production, this is wired to an external momentary switch accessible through the enclosure. |
+| `BOOT0` | **Boot Mode Select** | Input (Pull-Down via 10kΩ) | Normally held LOW (run from Flash). If held HIGH during reset, the STM32 boots from its internal System ROM bootloader (for DFU/USB recovery). In production, this pin is permanently tied to GND via a PCB resistor. |
+
+#### SWD Debug Interface (Programming Header)
+
+| Pin | Name | Direction | Purpose |
+| :--- | :--- | :--- | :--- |
+| `PA13` | `SWDIO` | Bidirectional | Serial Wire Debug data. Used for GDB hardware breakpoints and live memory inspection via ST-LINK. |
+| `PA14` | `SWCLK` | Input (from ST-LINK) | Serial Wire Debug clock @ 4 MHz. |
+| `PB3` | `SWO` | Output | Serial Wire Output — used by SEGGER SystemView for non-intrusive RTOS trace. Runs at full SWD clock speed. |
+| `NRST` | `NRST` | Bidirectional | ST-LINK can assert this to halt/reset the MCU remotely during debug sessions. |
+
+> ⚠️ **Production Lockdown (RDP Level 2):** After factory programming, the `RDP` option bytes are permanently set to Level 2. This **physically and irreversibly disables** the SWD debug port (PA13/PA14). Once set, no debugger, no programmer, and no attack can ever read the Flash contents. The LEDs and UART become the only diagnostic interfaces.
 
 ---
 
