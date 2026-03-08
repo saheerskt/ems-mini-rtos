@@ -2160,12 +2160,42 @@ In a **standard** STM32 project (no bootloader), you compile *one single `.elf` 
 
 In **our project**, we have **two completely separate firmware projects**, each compiled independently into its own `.elf` and `.bin`:
 
-| Binary | Source Project | Linker Origin | Flashed To | Contains |
-| :--- | :--- | :--- | :--- | :--- |
-| **`mcuboot.bin`** | MCUboot (separate C project) | `0x08000000` | `st-flash write mcuboot.bin 0x08000000` | Bootloader code + embedded ECDSA public key |
-| **`ems_rtos_signed.bin`** | ems-mini-rtos (our project) | `0x08040000` | `st-flash write ems_rtos_signed.bin 0x08040000` | FreeRTOS application + signed image header |
+In **our project**, we have **two completely separate firmware projects**, each compiled independently into its own `.elf` and `.bin`.
 
-They are **never combined into a single `.elf`**. Each has its own linker script pointing to a different Flash origin. At the factory, they are flashed sequentially as two separate `st-flash write` commands.
+### ❓ Why isn't a bootloader "standard" in RTOS?
+
+In the Embedded Linux world (i.MX93), a bootloader like **U-Boot** is **mandatory**. The CPU cannot run Linux directly from power-on because Linux needs a complex environment (DRAM initialized, filesystem mounted, kernel loaded into RAM). 
+
+In the RTOS/MCU world (STM32), a bootloader is **optional**. 
+*   **XIP (Execute-In-Place)**: The STM32 hardware is hard-wired to look at address `0x08000000` (Flash) on reset. If your app is there, it runs immediately. 
+*   **Simplicity**: Most hobbyist or simple IoT projects avoid bootloaders to save Flash space and complexity.
+
+### 🛡️ Why did we move to MCUboot? (The Industrial Requirement)
+
+We added **MCUboot** specifically to satisfy **IEC 62061** and commercial security requirements:
+1.  **Image Authentication**: Without a bootloader, the STM32 will run *anything* flashed to it (including malicious code). MCUboot checks a cryptographic signature before letting the app run.
+2.  **Resilient OTA**: If an update fails mid-way, a standard project "bricks." MCUboot allows us to "swap back" to the previous working version automatically.
+
+### 🔄 Hardware Reset Flow: Standard vs. Our Project
+
+| Step | **Standard RTOS Project** | **Our EMS Project (With MCUboot)** |
+| :--- | :--- | :--- |
+| **0ms (Reset)** | Hardware jumps to `0x08000000`. | Hardware jumps to `0x08000000`. |
+| **1ms** | **Reset_Handler** for the App runs. | **Reset_Handler** for **MCUboot** runs. |
+| **10ms** | App initializes C environment. | MCUboot verifies the app signature at `0x08040000`. |
+| **50ms** | `osKernelStart()` → App Running. | MCUboot jumps to `0x08040000`. |
+| **60ms** | — | **Reset_Handler** for the App runs. |
+| **100ms** | — | `osKernelStart()` → App Running. |
+
+### 🔨 How we generated the Bootloader vs. App
+
+To achieve this, we had to "decouple" the project into two binaries that can never overlap:
+
+1.  **Generating MCUboot**: We used the open-source MCUboot project, configured it for the STM32F407 memory map, and compiled it into `mcuboot.bin`. This project's linker script is hard-coded to origin `0x08000000`.
+2.  **The App Change**: We modified our EMS project's Linker Script (`STM32F407VGTX_FLASH.ld`) to **NOT** start at `0x08000000`. We shifted it to `0x08040000` so we don't overwrite the bootloader.
+3.  **The "Magic Trailer"**: At the very end of our App binary, we added 4096 bytes of metadata (the trailer) which contains the digital signature and "Image OK" flags that MCUboot reads.
+
+Each binary is a separate project. At the factory, we flash **both** using two commands, creating a secure trust chain.
 
 ```
  Flash Memory Map (1MB = 0x08000000 to 0x080FFFFF)
