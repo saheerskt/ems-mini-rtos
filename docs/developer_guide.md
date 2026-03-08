@@ -33,6 +33,7 @@
 22. [Load Balancing & Time-Based Control](#22-load-balancing--time-based-control)
 23. [Interview Practice Question Bank](#23-interview-practice-question-bank)
 24. [Answer Reference Sheet](#24-answer-reference-sheet)
+25. [Commercial Toolchain & Licensing](#25-commercial-toolchain--licensing)
 
 ---
 
@@ -51,7 +52,8 @@ The answer lies in **Deterministic Decoupling**.
 2. **Preemptive Prioritization:** FreeRTOS provides a "Preemptive Kernel". If the CPU is busy grinding through a lower-priority task like formatting a massive JSON payload from the Cloud (`Task_Net`), and a critical Modbus DMA timer expires (`Task_Poll`), FreeRTOS physically context-switches the CPU. It pauses the JSON parsing mid-instruction, hands 100% of the CPU to flush the physical Modbus queues, and then gracefully resumes the JSON parsing exactly where it left off. A bare-metal architecture cannot easily achieve this without unmaintainable "spaghetti" nested-interrupt state machines.
 3. **Power & Thermal Efficiency:** A bare-metal super-loop constantly consumes 100% of the CPU clock cycles polling via `if (flag_ready)`. With FreeRTOS, tasks that are waiting for timeouts or hardware DMA signals enter the `Blocked` state. This automatically forces the FreeRTOS Scheduler into the `Idle Task`, which executes the native ARM assembly instruction `WFI` (Wait For Interrupt). This physically halts the ALU clock tree, dropping CPU power consumption to near zero when the system is purely waiting on physical hardware, extending component lifespan and improving thermal constraints.
 
-### Hardware Profile: STM32F407VGT6
+### Hardware & Software Stack
+*   **RTOS Kernel:** FreeRTOS V10.3.1 (CMSIS-RTOS v2.1)
 *   **Clock:** 168 MHz (via PLL)
 *   **Industrial Bridges:** Modbus RTU (USARTs with DMA) & Battery BMS (Hardware CAN)
 *   **Networking:** WIZnet W5500 via SPI (Offloaded TCP/IP Stack)
@@ -1617,7 +1619,7 @@ We implemented an **"Image Confirmation"** fail-safe mechanism:
 
 ## 7. The OS API Layer: Why CMSIS-RTOS v2?
 
-If you inspect the codebase, you will notice we use commands like `osDelay()` and `osMessageQueuePut()` instead of FreeRTOS native commands like `vTaskDelay()` and `xQueueSend()`. This is because we wrap FreeRTOS inside **CMSIS-RTOS v2** (Cortex Microcontroller Software Interface Standard).
+We use the **CMSIS-RTOS v2 API (Version 2.1.3)** as our primary abstraction layer over the **FreeRTOS V10.3.1** kernel. If you inspect the codebase, you will notice we use commands like `osDelay()` and `osMessageQueuePut()` instead of FreeRTOS native commands like `vTaskDelay()` and `xQueueSend()`. This is because we wrap FreeRTOS inside **CMSIS-RTOS v2** (Cortex Microcontroller Software Interface Standard).
 
 ### Why use CMSIS-RTOS v2 instead of native FreeRTOS without CMSIS?
 1. **Portability & Abstraction:** CMSIS-RTOS v2 is a standardized API created by ARM. By using it, our application code doesn't strictly know it is running "FreeRTOS". If, in the future, we need to migrate the EMS Mini to an RTOS provided by another vendor (like Keil RTX, Azure RTOS/ThreadX, or Zephyr), we do not have to rewrite a single line of application code. The `osThreadNew()` command works universally across ARM-supported RTOS platforms, whereas `xTaskCreate()` strictly locks us into FreeRTOS.
@@ -3430,4 +3432,33 @@ For the highest absolute safety in environments spanning extreme temperatures wh
 
 ---
 
+---
+
+## 25. Commercial Toolchain & Licensing
+
+For a production-grade industrial deployment, it is critical to move beyond "evaluation" licenses and ensure all components of the build and debug stack are legally compliant for commercial revenue.
+
+### 🛠️ Software & Middleware Licenses
+
+| Component | License Type | Commercial Cost | Notes |
+| :--- | :--- | :--- | :--- |
+| **FreeRTOS V10.3.1** | **MIT** | **$0 (Free)** | Fully permissive. No royalties or per-unit costs to Amazon. |
+| **CMSIS-RTOS v2** | **Apache 2.0** | **$0 (Free)** | ARM-standard abstraction, open-source and free for commercial use. |
+| **STM32CubeIDE / MX** | **ST SLA** | **$0 (Free)** | Free to use as long as the target silicon is an ST product. |
+| **ARM GNU Toolchain** | **GPL / BSD** | **$0 (Free)** | The standard `arm-none-eabi-gcc` suite is open-source. |
+| **SEGGER SystemView** | **Commercial (CUL)** | **~$1,880 USD** | Required for commercial revenue. License is typically locked to the J-Link probe SN. |
+| **SEGGER Ozone** | **Proprietary** | **Included** | High-end debugger included with J-Link Plus/Ultra+/Pro probes. |
+| **MCUboot** | **Apache 2.0** | **$0 (Free)** | Flexible bootloader, free for commercial IoT. |
+| **WIZnet ioLib_Driver**| **BSD** | **$0 (Free)** | Free for use with WIZnet hardware (W5500). |
+
+### 🔌 Hardware Debugging & Logic Analysis
+
+| Device | Model | Est. Price | Commercial Rationale |
+| :--- | :--- | :--- | :--- |
+| **SEGGER J-Link** | **Base / Plus** | **$400 - $650** | Industrial standard for speed and stability. The "Plus" model includes many software licenses (Ozone, J-Flash). |
+| **Saleae Logic** | **Logic Pro 8** | **~$999** | Essential for protocol timing verification (Modbus/CAN). Software is free; hardware is the license. |
+| **ST-LINK/V2** | **V2-ISOL** | **~$120** | Cheap alternative for factory flashing, but slower for real-time RTOS trace. |
+
+### 💰 Total "Project Startup" Tooling Cost: **~$3,500 - $4,000**
+This is a one-time engineering investment (Capex) that allows a team to move from prototype to industrial-grade production with legal safety and high-speed debugging performance.
 

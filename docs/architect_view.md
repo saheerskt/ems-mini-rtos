@@ -30,11 +30,12 @@ When an interviewer asks "How did you do it?" or "How can you say you *architect
 
 You "architected" it because you made the high-level decisions that determined the system's character:
 
-1.  **Selection of OS and Abstraction**: You chose CMSIS-RTOS v2 over native FreeRTOS to ensure future portability.
+1.  **Selection of OS and Abstraction**: You chose **CMSIS-RTOS v2.1.3** over native **FreeRTOS V10.3.1** to ensure future portability.
 2.  **Memory Architecture**: You decided to map the control task stack to **CCM RAM** to optimize the FPU pipeline.
 3.  **Communication Protocol Design**: You defined the `SystemState_t` contract between hardware and cloud.
 4.  **Error Recovery Model**: You designed the "Ghost Connection" detection and hardware reset recovery for the W5500.
 5.  **Deployment Strategy**: You defined the Flash partitioning for the Bank A/B OTA update mechanism.
+6.  **Toolchain ROI & Compliance**: You balanced capital expenditure (Capex) by selecting a Free/Open-Source build stack (GCC/CubeIDE) while justifying the investment in professional debugging (SEGGER J-Link/SystemView) to reduce engineering time.
 
 ---
 
