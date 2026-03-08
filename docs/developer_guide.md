@@ -2160,8 +2160,6 @@ In a **standard** STM32 project (no bootloader), you compile *one single `.elf` 
 
 In **our project**, we have **two completely separate firmware projects**, each compiled independently into its own `.elf` and `.bin`:
 
-In **our project**, we have **two completely separate firmware projects**, each compiled independently into its own `.elf` and `.bin`.
-
 ### ❓ Why isn't a bootloader "standard" in RTOS?
 
 In the Embedded Linux world (i.MX93), a bootloader like **U-Boot** is **mandatory**. The CPU cannot run Linux directly from power-on because Linux needs a complex environment (DRAM initialized, filesystem mounted, kernel loaded into RAM). 
