@@ -180,13 +180,14 @@ When Linux initiates `ems-app.service`, the `main.cpp` routine spawns independen
 
 The primary mathematical objective of the CEMS gateway is found inside `hems_control.cpp`. It balances dynamic system limits and evaluates strict **Timeslot Schedules** driven by the user.
 
-### 4.1 Boundary Evaluation (Order of Operations)
-Before making an energy routing decision, the engine clamps mathematical goals into safe physical boundaries:
-1.  **Limits Override Constraints:** Even if the algorithm wants to dump 100kW, if the hardware structure limits state `maxPowerLimit = 50kW`, the math is clamped natively.
-2.  **Ensure `minGoal <= maxGoal`:** Pre-flight math to prevent logic inversion faults.
+### 4.1 Redis Timeslot Evaluation and Precedence
+A fundamental mechanism of the i.MX93 CEMS is evaluating highly sophisticated predictive schedules set by the user (stored as `hems_timeslot_t` arrays) through Redis. A timeslot has specific constraints for Import, Export, and targeted Power Goals. Constraints strictly execute inside an order-of-operations clamp to protect hardware (`clamp_desired_goals_to_bounds`):
+1.  **Limits Override Constraints:** Hardware `minPowerLimit` & `maxPowerLimit` (e.g., maximum fuse rating of the building) guarantee minimum baselines that can never be bypassed, regardless of what the user tries to schedule.
+2.  **Constraints Override Goals:** Operational ranges (e.g., maximum limits of the solar inverter's physical capability) clamp user or cloud-directed performance Goals.
+3.  **Ensure `minGoal <= maxGoal`:** Final pre-flight mathematical bounds checking prevents logic inversion faults from causing unexpected inverter behavior.
 
-### 4.2 Algorithm: The Decision Mode Engine
-The system analyzes the real-time `total_grid_active_power` reading against the computed boundaries and actively shifts physical hardware into one of four `OpMode` states:
+### 4.2 Algorithm: The Decision Mode Engine (`compute_mode_and_power`)
+Once the target boundary goals are established by the Timeslot rules, the C++ engine distributes the strategy across the three physical electrical phases globally. The system analyzes the real-time `total_grid_active_power` reading against the computed boundaries and actively shifts physical hardware into one of four distinct `OpMode` states:
 
 ```mermaid
 stateDiagram-v2
@@ -214,11 +215,20 @@ stateDiagram-v2
     }
 ```
 
-*   **`0x00` IDLE:** No active timeslot boundaries command the system. The inverters are placed in standby.
-*   **`0x03` ECO_BALANCING:** The grid export limit is rigidly set to `0 Watts` (`minPowerGoal == 0` & `maxPowerGoal == 0`). The system perfectly reacts to internal site loads by ramping inverters to precisely match internal power draw, ensuring absolutely zero wattage spills backwards onto the utility grid!
-*   **Ranged Active Feedback (Peak Shaving / Valley Filling):** 
-    *   If Grid active power violently exceeds the `maxPowerGoal` (a heavy facility load like a Chiller kicks on), the engine switches to `0x02 DISCHARGING`, splitting the requested offset across the 3 physical electrical phases to knock the peak load down.
-    *   If Grid active power drops entirely below `minPowerGoal` (facility load drops), the engine switches to `0x01 CHARGING`, siphoning excess cheap grid capacity quietly back into the batteries.
+*   **`0x00` IDLE:** The default fallback state. If no active timeslots dictate boundaries, the system defaults to Idle, effectively bypassing power overrides and defaulting all inverter goals to zero Watts.
+*   **`0x03` ECO_BALANCING:** Triggered explicitly when `minPowerGoal == 0` & `maxPowerGoal == 0`. The grid export limit is rigidly set to `0 Watts`. Outputs exactly zero watts to all phases, designed to perfectly match internal site loads by ramping inverters to precisely mirror internal power draw, ensuring absolutely zero wattage spills backwards onto the utility grid.
+*   **`0x01` CHARGING:** Triggered when timeslot boundaries strictly demand grid import (e.g., force charging the batteries during cheap overnight energy tariffs). Specifically, if `(maxPowerGoal > 0) && (minPowerGoal == maxPowerGoal)`. The requested charge wattage is proportionally divided across generated phases: `maxPowerGoal / num_phases`.
+*   **`0x02` DISCHARGING:** Triggered when timeslot boundaries strictly demand export (e.g., forcing stored battery energy back onto the grid during expensive peak hours to make money). Specifically, if `(minPowerGoal < 0) && (maxPowerGoal == minPowerGoal)`. The requested discharge wattage is equally sliced: `minPowerGoal / num_phases`.
+
+### 4.3 Ranged Active Feedback (Peak Shaving / Valley Filling)
+When the `minPowerGoal` and `maxPowerGoal` differ (forming an acceptable window rather than a rigid forced limit), the mode fluidly transitions dynamically between Charging and Discharging based on instantaneous real-word grid conditions:
+*   **Peak Shaving (Excess Grid Load):** If the absolute summation of real grid meter active power violently exceeds the `maxPowerGoal` (a heavy facility load like a Chiller kicks on), the engine switches to `0x02 DISCHARGING`. Crucially, it traverses Phases A, B, and C independently. Only phases where the specific phase load explicitly exceeds the average threshold trigger discharging offsets, knocking the peak load down mathematically.
+*   **Valley Filling (Missing Grid Load):** If `total_grid_active_power` drops entirely below `minPowerGoal`, the engine switches to `0x01 CHARGING`, siphoning excess cheap grid capacity quietly back into the batteries from the strictly low-load phases.
+
+### 4.4 Hardware Protection Strategies (Smart Power Controls)
+Built into the algorithm are deep C++ safety fallbacks polled continuously:
+- **`BAT_RampingSOC`:** Overrides standard logic to enforce slow trickle limits when the battery is near 100% full, preventing degradation.
+- **Thermal & Voltage Capping:** Minimum and Maximum Battery Voltage or Temperature differentials actively override generation limit parameters, bypassing normal Timeslot limits to protect the physical lithium cells.
 
 ---
 

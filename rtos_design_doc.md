@@ -212,6 +212,8 @@ flowchart TD
 
     EEPROM[("Internal Flash<br>(Virtual EEPROM)")]:::mem
     OTA[("Internal Flash<br>(OTA Bank 2)")]:::mem
+    VBAT["CR2032 Coin Cell<br>(VBAT Power)"]:::port
+    XTAL["32.768 kHz Crystal<br>(LSE Clock)"]:::port
 
     %% Connections
     STM <-->|"SPI1 (PA5-PA7, CS: PA4)"| W5500
@@ -228,6 +230,8 @@ flowchart TD
 
     STM -.->|"Reads Settings"| EEPROM
     STM -.->|"Downloads Updates"| OTA
+    STM <-->|"VBAT Pin"| VBAT
+    STM <-->|"PC14 / PC15"| XTAL
 ```
 
 ---

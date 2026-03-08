@@ -30,6 +30,7 @@
 19. [Efficiency, Optimizations & Memory Footprint](#19-efficiency-optimizations--memory-footprint)
 20. [System Reliability & Product Safety](#20-system-reliability--product-safety)
 21. [Potential Questions & Answers](#21-potential-questions--answers)
+22. [Load Balancing & Time-Based Control](#22-load-balancing--time-based-control)
 
 ---
 
@@ -1805,6 +1806,9 @@ graph TD
         CAN[TJA1050 CAN Transceiver]:::hardware
         RS485[MAX3485 Modbus Transceiver]:::hardware
         ETH[W5500 Ethernet SPI]:::hardware
+        RTC_HW[Internal RTC & Backup Block]:::hardware
+        VBAT[CR2032 Coin Cell]:::hardware
+        XTAL[32.768kHz LSE Crystal]:::hardware
         
         TP[Task_Poll<br>Priority: 48 / High]:::rtos
         TC[Task_Ctrl<br>Priority: 40 / Medium]:::rtos
@@ -1826,6 +1830,10 @@ graph TD
         QCMD --> TC
 
         TC -->|Modbus Write Override| TP
+        
+        VBAT -.->|Maintains Time| RTC_HW
+        XTAL -.->|PC14/PC15 Clock| RTC_HW
+        RTC_HW <-->|HAL_RTC_GetTime| TC
     end
 
     subgraph "The Internet"
@@ -2338,6 +2346,115 @@ Since this is an always-on edge node, energy management is a background concern.
 **A104.** BOR (Brown-Out Reset) is a hardware voltage monitor. We configure BOR Level 3 (threshold ≈ 2.7V). If the VDD supply drops below 2.7V (from a grid fault, or a failing power supply), the BOR circuit holds the CPU in reset. This prevents the CPU from writing corrupted data to Flash under low voltage, which can permanently brick the device.
 
 **A105.** If `Task_Poll` hangs (e.g., stuck waiting forever on a dead semaphore or in an infinite loop), two things happen: ① `Task_Ctrl` never receives new telemetry on `Queue_Data` and enters indefinite Blocked state — inverter commands stop, the system enters safe idle. ② `Task_Poll` stops calling `HAL_IWDG_Refresh()`. Within 2 seconds, the IWDG hardware timer expires and triggers a full CPU reset, returning the system to normal operation automatically.
+
+---
+
+## 22. Load Balancing & Time-Based Control
+
+### The i.MX93 (`ems-app`) vs. STM32 (`ems-mini-rtos`) Load Balancing Logic
+
+The load balancing philosophies drastically differ between the flagship Embedded Linux CEMS and the RTOS mini edge-node counterpart.
+
+#### `ems-app` (i.MX93) Strategy: Predictive & Scheduled
+The Linux-based architecture leverages its vast RAM (GBs) and persistent local database (Redis broker) to run a continuous, complex 2-second decision loop (`hems_control.cpp`).
+*   **Time Schedules (Timeslots):** The system relies heavily on `hems_timeslot_t` arrays defined by the user. These schedules command explicit Import, Export, and target Power Goals for specific times of the day.
+*   **Dynamic Phase Distribution:** It fluidly alternates among four modes (`IDLE`, `ECO_BALANCING`, `CHARGING`, `DISCHARGING`), precisely distributing power across 3 phases (Peak Shaving or Valley Filling) based on the instantaneous grid conditions combined with the current timeslot bounds.
+*   **Programmable Equations:** Uses `logic.cpp` to evaluate on-the-fly user-defined math equations to map system behavior dynamically without recompiling.
+
+#### `ems-mini-rtos` (STM32) Strategy: Deterministic & Instantaneous
+The RTOS version completely lacks the storage/RAM to hold massive JSON databases of predictive timeslots and lacks a Python runtime to seamlessly manage UI scheduling data.
+*   **No Multi-Day Predictive Timeslots:** Complex schedules cannot be generated or stored locally out-of-the-box.
+*   **Instantaneous Control:** Decisions are made strictly based on raw physical telemetry pulled during `Task_Poll`. If the Grid Meter reads that import exceeds a hardcoded `MaxLimit`, `Task_Ctrl` instantly calculates the delta and commands the inverter to discharge.
+*   **Hardcoded Protection:** Safety overrides—like battery charging current limits scaling down during high temperatures—are statically compiled in C rather than dynamic logic evaluations.
+
+**RTOS Instantaneous Control Loop Flow:**
+```mermaid
+stateDiagram-v2
+    direction LR
+    
+    state "Task_Poll (High Priority)" as Task_Poll {
+        Rx_DMA --> Parse_Struct
+        Parse_Struct --> Push_Queue
+    }
+    
+    state "Task_Ctrl (Medium Priority)" as Task_Ctrl {
+        Pop_Queue --> Math_Clamp
+        Math_Clamp --> Check_Failsafes
+        Check_Failsafes --> Dispatch_Tx
+    }
+    
+    Grid_Meter --> Task_Poll : Modbus Telegram (RS-485)
+    Task_Poll --> Task_Ctrl : SystemState_t (0 Wait States via Queue)
+    Task_Ctrl --> Inverter : Modbus Command (Discharge / Charge)
+```
+
+### Is there Time-Based Control in the RTOS setup?
+
+Natively, out of the box, the FreeRTOS EMS project **lacks complex absolute time-of-day control (like Linux `cron`)** because microcontrollers do not have an inherently synced system clock upon boot. 
+
+However, **it is entirely possible to add precise time-based control** to the RTOS project depending on the exact requirements. Here is how it can be implemented in detail:
+
+#### 1. Internal Hardware RTC (Real-Time Clock) & Backup Registers
+The STM32F407 silicon features a robust internal RTC peripheral that spans an isolated power domain. 
+*   **Implementation:** 
+    1.  Enable the RTC in STM32CubeIDE (`System Core > RTC`).
+    2.  Supply a 32.768 kHz quartz crystal to the `LSE` (Low-Speed External) oscillator pins (`PC14` and `PC15`). This provides absolute timing accuracy.
+    3.  Route a standard CR2032 coin-cell battery to the `VBAT` physical pin. Even if the main 3.3V system power fails, `VBAT` keeps the RTC ticking continuously.
+
+*   **Controlling the RTC (Reading and Writing):**
+    Unlike standard variables, the RTC time is stored in protected hardware registers to prevent accidental corruption. To safely interact with the HAL API, you must always read or write **both Time and Date** sequentially.
+
+    **Example: Writing the Time (Setting the Clock)**
+    ```c
+    RTC_TimeTypeDef sTime = {0};
+    RTC_DateTypeDef sDate = {0};
+
+    // 1. Set Time (e.g. 14:30:00)
+    sTime.Hours = 14;
+    sTime.Minutes = 30;
+    sTime.Seconds = 0;
+    // Format is BIN explicitly (not BCD)
+    HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+
+    // 2. Set Date (Must be set together!)
+    sDate.Year = 24; // 2024
+    sDate.Month = RTC_MONTH_OCTOBER;
+    sDate.Date = 15;
+    HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+    ```
+
+    **Example: Reading the Time (Executing Logic)**
+    *Critical Note:* You **must** read `GetTime` followed immediately by `GetDate`. Reading the Time locks the hardware shadow registers so you get a consistent snapshot; reading the Date unlocks them.
+    ```c
+    RTC_TimeTypeDef currTime = {0};
+    RTC_DateTypeDef currDate = {0};
+
+    // Read Time FIRST, then Date to unlock hardware registers
+    HAL_RTC_GetTime(&hrtc, &currTime, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &currDate, RTC_FORMAT_BIN); 
+
+    // Execute Time-Of-Use Load Balancing logic inside Task_Ctrl
+    if (currTime.Hours >= 2 && currTime.Hours < 5) {
+        set_inverter_mode(OP_MODE_FORCE_CHARGE); // Valley filling at 2AM
+    }
+    ```
+
+*   **Hardware Alarms & Battery-Backed SRAM:** 
+    Beyond timekeeping, the RTC peripheral block provides configuring `RTC Alarm A` hardware interrupts, allowing `Task_Ctrl` to sleep at 0% CPU and wake up *exactly* at a specific second. Additionally, this domain grants access to **20 Backup Registers** (80 bytes total). These 32-bit registers survive system reboots and power losses (powered by `VBAT`), making them the perfect place to safely store a "Crash Reason" before triggering a hardware watchdog reset.
+
+#### 2. FreeRTOS Software Timers (For Relative Delays)
+If the system does not care about the "Time of Day" (e.g., 2:00 PM) but only cares about "Duration" (e.g., "Charge for exactly 2 hours after a command is received"), we use the FreeRTOS Timer API.
+*   **Implementation:** Call `xTimerCreate()` and `xTimerStart()`. 
+*   **Logic:** The FreeRTOS Daemon Task (`tmrtask`) will run a callback exactly after the specified thousands of FreeRTOS ticks have elapsed. This is highly RAM efficient and requires no hardware RTC.
+
+#### 3. Cloud Synchronization (NTP via W5500)
+If the STM32 has an active internet connection through the W5500 ethernet chip, time schedules can be kept incredibly accurate without a coin-cell battery.
+*   **Implementation:** Modify `Task_Net` to routinely execute a lightweight UDP socket request to an NTP pool (e.g., `pool.ntp.org`) via the W5500.
+*   **Logic:** Upon parsing the UNIX timestamp from the NTP server, `Task_Net` updates the STM32's internal RTC. 
+*   **Dynamic Schedules:** With NTP synced, the Cloud (via MQTT) can push a lightweight JSON array to the STM32 (e.g., `[{"start":1704067200,"mode":1}]`). `Task_Ctrl` stores this tiny array in SRAM and evaluates it continuously against the NTP-synced clock, effectively reproducing the `ems-app` timeslot behavior on a micro-scale.
+
+#### 4. External I2C RTC (e.g., DS3231)
+For the highest absolute safety in environments spanning extreme temperatures where the internal STM32 RTC might drift, an external temperature-compensated RTC (DS3231) is wired via I2C. `Task_Poll` reads this module every few seconds to guarantee hard compliance with utility grid Time-of-Use tariffs.
 
 ---
 <div align="center">
