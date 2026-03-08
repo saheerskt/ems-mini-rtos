@@ -36,7 +36,7 @@ You "architected" it because you made the high-level decisions that determined t
 4.  **Error Recovery Model**: You designed the "Ghost Connection" detection and hardware reset recovery for the W5500.
 5.  **Deployment Strategy**: You defined the Flash partitioning for the Bank A/B OTA update mechanism.
 6.  **Toolchain ROI & Compliance**: You balanced capital expenditure (Capex) by selecting a Free/Open-Source build stack (GCC/CubeIDE) while justifying the investment in professional debugging (SEGGER J-Link/SystemView) to reduce engineering time.
-
+7. **Functional Safety (IEC 62061 SIL-2) Rationale**: In industrial EMS, software is safety-critical. The RTOS architecture follows **SIL-2 design patterns** (Independent Watchdogs, Deterministic Preemption, Static Allocation) to satisfy IEC 62061 requirements. We ensure that a network failure never compromises the "Safe State" of the battery contactors.7. **Functional Safety (IEC 62061) vs. Cybersecurity (IEC 62443)**: We employ a **Split-Integrity Architecture**. High-level Linux logic (`ems-app`) focuses on **IEC 62443** security. All safety-critical hardware enforcement is offloaded to the STM32 RTOS (`ems-mini-rtos`), which follows **IEC 62061 SIL-2** principles to act as a deterministic "Safety Supervisor," protecting the battery assets even if the Linux host is compromised.
 ---
 
 ## 3. Technical Implementation Deep-Dive
