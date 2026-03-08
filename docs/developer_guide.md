@@ -17,20 +17,22 @@
 6. [Over-The-Air (OTA) Updates & Memory Protection](#6-over-the-air-ota-updates--memory-protection)
 7. [The OS API Layer: Why CMSIS-RTOS v2?](#7-the-os-api-layer-why-cmsis-rtos-v2)
 8. [FreeRTOS Feature Checklist](#8-freertos-feature-checklist)
-9. [Unused FreeRTOS Features](#9-unused-freertos-features)
-10. [Project Design & Team Methodology](#10-project-design--team-methodology)
-11. [Testing, Mocking & Static Analysis](#11-testing-mocking--static-analysis)
-12. [Toolchain & Advanced Debugging Stack](#12-toolchain--advanced-debugging-stack)
-13. [Hardware Selection: Why the STM32F407?](#13-hardware-selection-why-the-stm32f407)
-14. [Estimated Hardware & Bill of Materials (BOM) Cost](#14-estimated-hardware--bill-of-materials-bom-cost)
-15. [C Code to Silicon: The Build Flow & Linker Mapping](#15-c-code-to-silicon-the-build-flow--linker-mapping)
-16. [The System Boot Flow & Timings](#16-the-system-boot-flow--timings)
-17. [High-Level Architecture & Hardware Schematics](#17-high-level-architecture--hardware-schematics)
-18. [Major Challenges & Solutions](#18-major-challenges--solutions)
-19. [Efficiency, Optimizations & Memory Footprint](#19-efficiency-optimizations--memory-footprint)
-20. [System Reliability & Product Safety](#20-system-reliability--product-safety)
-21. [Potential Questions & Answers](#21-potential-questions--answers)
+9. [System Timing & Frequencies Cheat Sheet](#9-system-timing--frequencies-cheat-sheet)
+10. [Unused FreeRTOS Features](#10-unused-freertos-features)
+11. [Project Design & Team Methodology](#11-project-design--team-methodology)
+12. [Testing, Mocking & Static Analysis](#12-testing-mocking--static-analysis)
+13. [Toolchain & Advanced Debugging Stack](#13-toolchain--advanced-debugging-stack)
+14. [Hardware Selection: Why the STM32F407?](#14-hardware-selection-why-the-stm32f407)
+15. [Estimated Hardware & Bill of Materials (BOM) Cost](#15-estimated-hardware--bill-of-materials-bom-cost)
+16. [C Code to Silicon: The Build Flow & Linker Mapping](#16-c-code-to-silicon-the-build-flow--linker-mapping)
+17. [The System Boot Flow & Timings](#17-the-system-boot-flow--timings)
+18. [High-Level Architecture & Hardware Schematics](#18-high-level-architecture--hardware-schematics)
+19. [Major Challenges & Solutions](#19-major-challenges--solutions)
+20. [Efficiency, Optimizations & Memory Footprint](#20-efficiency-optimizations--memory-footprint)
+21. [System Reliability & Product Safety](#21-system-reliability--product-safety)
 22. [Load Balancing & Time-Based Control](#22-load-balancing--time-based-control)
+23. [Interview Practice Question Bank](#23-interview-practice-question-bank)
+24. [Answer Reference Sheet](#24-answer-reference-sheet)
 
 ---
 
@@ -1768,7 +1770,7 @@ flowchart TD
 
 ---
 
-## 11. Testing, Mocking & Static Analysis
+## 12. Testing, Mocking & Static Analysis
 
 Industrial automation demands proof of reliability before physical deployment.
 
@@ -1822,7 +1824,7 @@ flowchart TD
 
 ---
 
-## 12. Toolchain & Advanced Debugging Stack
+## 13. Toolchain & Advanced Debugging Stack
 
 Developing bare-metal code with physical hardware interfaces requires professional embedded tooling. `printf()` debugging over a serial port is wildly insufficient.
 
@@ -1925,7 +1927,7 @@ In STM32CubeIDE: `Window → Show View → SWV → SWV ITM Data Console`. Set th
 
 ---
 
-## 13. Hardware Selection: Why the STM32F407?
+## 14. Hardware Selection: Why the STM32F407?
 
 In a market saturated with microcontrollers, why did the team specifically select the STM32F407VGT6 for this Energy Management System?
 
@@ -2037,7 +2039,7 @@ flowchart LR
 
 > 💡 **Interview Key Point:** The STM32's `bxCAN` peripheral handles the **CAN protocol** (arbitration, bit stuffing, CRC, error frames) entirely in hardware. The TJA1050 only handles the **electrical signaling**. Without the TJA1050, the STM32 knows *what* to say but physically cannot *speak* on the bus.
 
-## 14. Estimated Hardware & Bill of Materials (BOM) Cost
+## 15. Estimated Hardware & Bill of Materials (BOM) Cost
 
 When designing an industrial-grade EMS controller for mass production, keeping hardware costs low while maintaining strict reliability is crucial. The strategic move from an Embedded Linux i.MX93 processor (which requires expensive DDR RAM, PMICs, and eMMC) down to a bare-metal RTOS on the STM32 brings a massive cost reduction.
 
@@ -2072,7 +2074,7 @@ This allows the entire firmware stack (including the custom `ims-rtos-mini` code
 
 ---
 
-## 15. C Code to Silicon: The Build Flow & Linker Mapping
+## 16. C Code to Silicon: The Build Flow & Linker Mapping
 
 To bridge the gap between high-level C logic and physical STM32 hardware execution, we rely on the GNU GCC toolchain. This is a multi-phase compilation process, meticulously mapped by the Linker Script.
 
@@ -2302,7 +2304,7 @@ sequenceDiagram
 
 ---
 
-## 16. The System Boot Flow & Timings
+## 17. The System Boot Flow & Timings
 
 When power is applied to the industrial **24V DC bus** from the battery racks, an onboard **DC-DC buck converter** steps the voltage down to a clean **3.3V rail** that feeds the STM32 and all 3.3V logic. The STM32 itself never sees 24V — it operates entirely on 3.3V. However, from a system perspective, the "power-on" event is the 24V bus energizing. The board does not instantly start running the FreeRTOS controller. It undergoes a rigid, multi-stage boot sequence designed for maximum industrial safety.
 
@@ -2574,7 +2576,7 @@ In production (RDP Level 2, no SWD), we configure MCUboot to toggle a dedicated 
 
 ---
 
-## 17. High-Level Architecture & Hardware Schematics
+## 18. High-Level Architecture & Hardware Schematics
 
 Below is the logical and electrical schematic diagram, mapping exactly how the embedded software threads physically inter-operate with the external copper traces of the PCB component blocks.
 
@@ -2693,7 +2695,7 @@ RS-485 Modbus uses **2 signal wires + 1 ground** (3 wires total). It is **half-d
 | **Wire 2** | `B` (Inverting / D-) | -7V to +12V | Data- line. Voltage difference (A-B) < -200mV = Logic `0` |
 | **Wire 3** | `GND` (Signal Ground) | 0V | Common ground reference between distant devices |
 
-> ⚠️ **Half-Duplex Direction Control:** The MAX3485's `DE` (Driver Enable) pin is wired to STM32 GPIO `PD4`. When `DE=HIGH`, the MAX3485 **transmits** (drives A/B lines). When `DE=LOW`, it **listens** (receives data from A/B). This pin must be toggled precisely between TX and RX — see Challenge 1 in Section 18 for how we solved the timing jitter bug.
+> ⚠️ **Half-Duplex Direction Control:** The MAX3485's `DE` (Driver Enable) pin is wired to STM32 GPIO `PD4`. When `DE=HIGH`, the MAX3485 **transmits** (drives A/B lines). When `DE=LOW`, it **listens** (receives data from A/B). This pin must be toggled precisely between TX and RX — see Challenge 1 in Section 19 for how we solved the timing jitter bug.
 
 #### Ethernet Wiring (To Cloud via RJ45)
 
@@ -2735,8 +2737,8 @@ Beyond communication buses, the PCB uses several GPIO pins for visual feedback, 
 | GPIO Pin | Name | Direction | Purpose |
 | :--- | :--- | :--- | :--- |
 | `NRST` | **Hardware Reset** (active-LOW) | Input | Physical reset pin on the STM32. Directly connected to a tactile push-button on the PCB and to the ST-LINK debug probe. Pulling this LOW forces an immediate silicon reset — equivalent to a full power cycle. The IWDG watchdog internally triggers this pin when it expires. |
-| `PB0` | **W5500 Hardware Reset** | Output (Push-Pull) | Connected to the W5500 Ethernet chip's `RST` pin. `Task_Net` pulses this LOW for 2ms to force a full hardware reset of the Ethernet chip when a ghost TCP connection is detected (see Challenge 4 in Section 18). |
-| `PD4` | **RS-485 DE (Direction Enable)** | Output (Push-Pull) | Controls the MAX3485 half-duplex direction. `HIGH` = transmit, `LOW` = receive. Toggled by the hardware `HAL_UART_TxCpltCallback()` ISR to avoid timing jitter (see Challenge 1 in Section 18). |
+| `PB0` | **W5500 Hardware Reset** | Output (Push-Pull) | Connected to the W5500 Ethernet chip's `RST` pin. `Task_Net` pulses this LOW for 2ms to force a full hardware reset of the Ethernet chip when a ghost TCP connection is detected (see Challenge 4 in Section 19). |
+| `PD4` | **RS-485 DE (Direction Enable)** | Output (Push-Pull) | Controls the MAX3485 half-duplex direction. `HIGH` = transmit, `LOW` = receive. Toggled by the hardware `HAL_UART_TxCpltCallback()` ISR to avoid timing jitter (see Challenge 1 in Section 19). |
 | `PA0` | **User Button (B1)** | Input (Pull-Down) | On the DISC1 dev board, this is the blue user push-button. In firmware, pressing this during boot forces MCUboot to roll back to the previous firmware bank (recovery mode). In production, this is wired to an external momentary switch accessible through the enclosure. |
 | `BOOT0` | **Boot Mode Select** | Input (Pull-Down via 10kΩ) | Normally held LOW (run from Flash). If held HIGH during reset, the STM32 boots from its internal System ROM bootloader (for DFU/USB recovery). In production, this pin is permanently tied to GND via a PCB resistor. |
 
@@ -2753,13 +2755,31 @@ Beyond communication buses, the PCB uses several GPIO pins for visual feedback, 
 
 ---
 
-## 18. Major Challenges & Solutions
+## 19. Major Challenges & Solutions
 
 While building this architecture, the team faced extreme bare-metal engineering hurdles:
 
 *   **Challenge 1: The Modbus RTU Half-Duplex Timing Jitter**
     *   **The Issue:** Modbus is an industrial protocol running on a physical RS-485 copper wire, which is *half-duplex*. The STM32's transceiver chip must be manually switched from "Transmit" mode into "Receive" mode using a physical `DE` (Data Enable) pin. The Modbus specification dictates a strict 3.5 character idle time between frames. If we toggled this pin in standard C code `HAL_UART_Transmit(); HAL_GPIO_WritePin(DE, LOW);`, the FreeRTOS scheduler would sometimes context-switch exactly between those two lines of code to service the network task. By the time the CPU returned to toggle the pin 2 milliseconds later, the slave inverter had already replied, the transceiver was stuck in "Transmit" mode, and the incoming bytes crashed into the chip and were lost forever.
     *   **The Solution:** We entirely abandoned software-based pin toggling. We bound the `DE` pin toggle directly to the bare-metal silicon interrupt `HAL_UART_TxCpltCallback()` (DMA Transmit Complete). This hardware interrupt forcibly preempts the FreeRTOS scheduler. The exact nanosecond the final bit leaves the silicon register, the hardware interrupts the CPU, throws the `DE` pin LOW, and instantly returns, eliminating 100% of the software jitter and achieving perfectly deterministic Modbus timing.
+    *   **Implementation Pseudo-Code:**
+        ```c
+        // ❌ WRONG: Software toggling is subject to RTOS context switches
+        void SendModbusPoll_Software() {
+            HAL_UART_Transmit(&huart1, tx_data, len, 100);
+            // <-- RTOS could switch here for 1ms! Transceiver stays in TX mode.
+            HAL_GPIO_WritePin(DE_GPIO_Port, DE_Pin, GPIO_PIN_RESET);
+        }
+
+        // ✅ RIGHT: Hardware interrupt toggling (Deterministic)
+        void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+            if (huart->Instance == USART1) {
+                // Fired by silicon nanoseconds after last bit leaves shift register
+                HAL_GPIO_WritePin(DE_GPIO_Port, DE_Pin, GPIO_PIN_RESET);
+                osSemaphoreRelease(txCompleteSem);
+            }
+        }
+        ```
 
 *   **Challenge 2: CAN Bus Mailbox Overflows (Hardware Starvation)**
     *   **The Issue:** The EMS connects to commercial battery racks via a 250kbps CAN bus using the J1939 protocol. These batteries are extremely "chatty", sometimes blasting 10 frames in under 5 milliseconds. The physical STM32F407 silicon only contains **three physical receive mailboxes**. If the CPU was busy calculating peak-shaving math inside `Task_Ctrl` for a few milliseconds, the 4th incoming CAN frame would physically overflow the silicon mailbox, permanently destroying critical battery voltage telemetry.
@@ -2772,6 +2792,27 @@ While building this architecture, the team faced extreme bare-metal engineering 
 *   **Challenge 4: W5500 SPI Socket Deadlocks & Ghost Connections**
     *   **The Issue:** Industrial networks are notoriously noisy. When connecting to Mosquitto MQTT over the WIZnet W5500, a Wi-Fi bridge or Ethernet switch reboot would sever the physical TCP link. However, because TCP/IP handles timeouts poorly, the STM32's `Task_Net` would often think the socket was still `ESTABLISHED` (a "ghost connection"), while the Cloud server had long ago dropped the client. The RTOS would hang indefinitely waiting for MQTT `PUBACK` packets that would never arrive.
     *   **The Solution:** We implemented an **Application-Layer Keep-Alive / MQTT PINGREQ Monitor**. Using a non-blocking timestamp method `(osKernelGetTickCount() - last_mqtt_rx > 15000)`, `Task_Net` monitors if it has received any data (including heartbeat pings) from the broker in the last 15 seconds. If the timer trips, the software strictly assumes the silent connection is dead, aggressively sends a hardware reset pulse to the W5500 `RST` pin, flushes the SPI registers, and attempts a clean socket re-initialization sequence from scratch.
+    *   **Implementation Pseudo-Code:**
+        ```c
+        void Task_Net(void *argument) {
+            uint64_t last_rx_tick = osKernelGetTickCount();
+            for(;;) {
+                if (getSn_SR(MQTT_SOCKET) == SOCK_ESTABLISHED) {
+                    // Check if we've heard from the broker recently
+                    if ((osKernelGetTickCount() - last_rx_tick) > 20000) {
+                        printf("[NET] Ghost connection detected! Forcing Hardware Reset.\n");
+                        force_w5500_hardware_reset(); // Pulse RST pin
+                        break; // Drop to reconnection logic
+                    }
+                    mqtt_yield(); // Process incoming packets
+                    if (packet_received) last_rx_tick = osKernelGetTickCount();
+                } else {
+                    reconnect_mqtt_sequence();
+                }
+                osDelay(100);
+            }
+        }
+        ```
 
 *   **Challenge 5: Silent RAM Corruptions (Stack Overflows)**
     *   **The Issue:** During early development, building complex JSON telemetry strings inside `Task_Net` using `snprintf()` would occasionally cause the entire board to freeze an hour later, seemingly randomly. The `Task_Net` variables were secretly growing larger than the 1024-byte RAM stack allocated to the thread, physically writing over the memory belonging to `Task_Poll`.
@@ -2779,7 +2820,7 @@ While building this architecture, the team faced extreme bare-metal engineering 
 
 ---
 
-## 19. Efficiency, Optimizations & Memory Footprint
+## 20. Efficiency, Optimizations & Memory Footprint
 
 ### What specific optimizations did we apply?
 In order to maximize silicon performance and hit our hard-realtime nanosecond budgets, we applied several drastic optimizations:
@@ -2812,7 +2853,7 @@ We selected this specific microcontroller because it provides massive headroom f
 
 ---
 
-## 20. System Reliability & Product Safety
+## 21. System Reliability & Product Safety
 
 In a true industrial automation environment, code perfection is an extreme baseline, but hardware exceptions (brownouts, cosmic rays, transient noise) are inevitable. We deployed specific silicon-level protections.
 
@@ -2836,7 +2877,120 @@ Since this is an always-on edge node, energy management is a background concern.
 
 ---
 
-## 21. Interview Practice Question Bank
+## 22. Load Balancing & Time-Based Control
+
+### The i.MX93 (`ems-app`) vs. STM32 (`ems-mini-rtos`) Load Balancing Logic
+
+The load balancing philosophies drastically differ between the flagship Embedded Linux CEMS and the RTOS mini edge-node counterpart.
+
+#### `ems-app` (i.MX93) Strategy: Predictive & Scheduled
+The Linux-based architecture leverages its vast RAM (GBs) and persistent local database (Redis broker) to run a continuous, complex 2-second decision loop (`hems_control.cpp`).
+*   **Time Schedules (Timeslots):** The system relies heavily on `hems_timeslot_t` arrays defined by the user. These schedules command explicit Import, Export, and target Power Goals for specific times of the day.
+*   **Dynamic Phase Distribution:** It fluidly alternates among four modes (`IDLE`, `ECO_BALANCING`, `CHARGING`, `DISCHARGING`), precisely distributing power across 3 phases (Peak Shaving or Valley Filling) based on the instantaneous grid conditions combined with the current timeslot bounds.
+*   **Programmable Equations:** Uses `logic.cpp` to evaluate on-the-fly user-defined math equations to map system behavior dynamically without recompiling.
+
+#### `ems-mini-rtos` (STM32) Strategy: Deterministic & Instantaneous
+The RTOS version completely lacks the storage/RAM to hold massive JSON databases of predictive timeslots and lacks a Python runtime to seamlessly manage UI scheduling data.
+*   **No Multi-Day Predictive Timeslots:** Complex schedules cannot be generated or stored locally out-of-the-box.
+*   **Instantaneous Control:** Decisions are made strictly based on raw physical telemetry pulled during `Task_Poll`. If the Grid Meter reads that import exceeds a hardcoded `MaxLimit`, `Task_Ctrl` instantly calculates the delta and commands the inverter to discharge.
+*   **Hardcoded Protection:** Safety overrides—like battery charging current limits scaling down during high temperatures—are statically compiled in C rather than dynamic logic evaluations.
+
+**RTOS Instantaneous Control Loop Flow:**
+```mermaid
+stateDiagram-v2
+    direction LR
+    
+    state "Task_Poll (High Priority)" as Task_Poll {
+        Rx_DMA --> Parse_Struct
+        Parse_Struct --> Push_Queue
+    }
+    
+    state "Task_Ctrl (Medium Priority)" as Task_Ctrl {
+        Pop_Queue --> Math_Clamp
+        Math_Clamp --> Check_Failsafes
+        Check_Failsafes --> Dispatch_Tx
+    }
+    
+    Grid_Meter --> Task_Poll : Modbus Telegram (RS-485)
+    Task_Poll --> Task_Ctrl : SystemState_t (0 Wait States via Queue)
+    Task_Ctrl --> Inverter : Modbus Command (Discharge / Charge)
+```
+
+### Is there Time-Based Control in the RTOS setup?
+
+Natively, out of the box, the FreeRTOS EMS project **lacks complex absolute time-of-day control (like Linux `cron`)** because microcontrollers do not have an inherently synced system clock upon boot. 
+
+However, **it is entirely possible to add precise time-based control** to the RTOS project depending on the exact requirements. Here is how it can be implemented in detail:
+
+#### 1. Internal Hardware RTC (Real-Time Clock) & Backup Registers
+The STM32F407 silicon features a robust internal RTC peripheral that spans an isolated power domain. 
+*   **Implementation:** 
+    1.  Enable the RTC in STM32CubeIDE (`System Core > RTC`).
+    2.  Supply a 32.768 kHz quartz crystal to the `LSE` (Low-Speed External) oscillator pins (`PC14` and `PC15`). This provides absolute timing accuracy.
+    3.  Route a standard CR2032 coin-cell battery to the `VBAT` physical pin. Even if the main 3.3V system power fails, `VBAT` keeps the RTC ticking continuously.
+
+*   **Controlling the RTC (Reading and Writing):**
+    Unlike standard variables, the RTC time is stored in protected hardware registers to prevent accidental corruption. To safely interact with the HAL API, you must always read or write **both Time and Date** sequentially.
+
+    **Example: Writing the Time (Setting the Clock)**
+    ```c
+    RTC_TimeTypeDef sTime = {0};
+    RTC_DateTypeDef sDate = {0};
+
+    // 1. Set Time (e.g. 14:30:00)
+    sTime.Hours = 14;
+    sTime.Minutes = 30;
+    sTime.Seconds = 0;
+    // Format is BIN explicitly (not BCD)
+    HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+
+    // 2. Set Date (Must be set together!)
+    sDate.Year = 24; // 2024
+    sDate.Month = RTC_MONTH_OCTOBER;
+    sDate.Date = 15;
+    HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+    ```
+
+    **Example: Reading the Time (Executing Logic)**
+    *Critical Note:* You **must** read `GetTime` followed immediately by `GetDate`. Reading the Time locks the hardware shadow registers so you get a consistent snapshot; reading the Date unlocks them.
+    ```c
+    RTC_TimeTypeDef currTime = {0};
+    RTC_DateTypeDef currDate = {0};
+
+    // Read Time FIRST, then Date to unlock hardware registers
+    HAL_RTC_GetTime(&hrtc, &currTime, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &currDate, RTC_FORMAT_BIN); 
+
+    // Execute Time-Of-Use Load Balancing logic inside Task_Ctrl
+    if (currTime.Hours >= 2 && currTime.Hours < 5) {
+        set_inverter_mode(OP_MODE_FORCE_CHARGE); // Valley filling at 2AM
+    }
+    ```
+
+*   **Hardware Alarms & Battery-Backed SRAM:** 
+    Beyond timekeeping, the RTC peripheral block provides configuring `RTC Alarm A` hardware interrupts, allowing `Task_Ctrl` to sleep at 0% CPU and wake up *exactly* at a specific second. Additionally, this domain grants access to **20 Backup Registers** (80 bytes total). These 32-bit registers survive system reboots and power losses (powered by `VBAT`), making them the perfect place to safely store a "Crash Reason" before triggering a hardware watchdog reset.
+
+#### 2. FreeRTOS Software Timers (For Relative Delays)
+If the system does not care about the "Time of Day" (e.g., 2:00 PM) but only cares about "Duration" (e.g., "Charge for exactly 2 hours after a command is received"), we use the FreeRTOS Timer API.
+*   **Implementation:** Call `xTimerCreate()` and `xTimerStart()`. 
+*   **Logic:** The FreeRTOS Daemon Task (`tmrtask`) will run a callback exactly after the specified thousands of FreeRTOS ticks have elapsed. This is highly RAM efficient and requires no hardware RTC.
+
+#### 3. Cloud Synchronization (NTP via W5500)
+If the STM32 has an active internet connection through the W5500 ethernet chip, time schedules can be kept incredibly accurate without a coin-cell battery.
+*   **Implementation:** Modify `Task_Net` to routinely execute a lightweight UDP socket request to an NTP pool (e.g., `pool.ntp.org`) via the W5500.
+*   **Logic:** Upon parsing the UNIX timestamp from the NTP server, `Task_Net` updates the STM32's internal RTC. 
+*   **Dynamic Schedules:** With NTP synced, the Cloud (via MQTT) can push a lightweight JSON array to the STM32 (e.g., `[{"start":1704067200,"mode":1}]`). `Task_Ctrl` stores this tiny array in SRAM and evaluates it continuously against the NTP-synced clock, effectively reproducing the `ems-app` timeslot behavior on a micro-scale.
+
+#### 4. External I2C RTC (e.g., DS3231)
+For the highest absolute safety in environments spanning extreme temperatures where the internal STM32 RTC might drift, an external temperature-compensated RTC (DS3231) is wired via I2C. `Task_Poll` reads this module every few seconds to guarantee hard compliance with utility grid Time-of-Use tariffs.
+
+---
+<div align="center">
+<i>Designed and Engineered by the EMS Firmware Team. Strictly Confidential.</i>
+</div>
+
+
+## 23. Interview Practice Question Bank
 
 > 💡 **How to use this section:** Each question below is fully answered somewhere in this guide. Use this as a self-test before interviews. Try to answer each one from memory, then cross-reference the relevant section.
 
@@ -2942,53 +3096,60 @@ Since this is an always-on edge node, energy management is a background concern.
 71. How does the CPU achieve 168 MHz and what is the role of the PLL and HSE crystal?
 72. What is the `.data` section and what does the C runtime `_start()` routine do with it?
 73. What is CCM RAM and why did you place `Task_Ctrl`'s stack there specifically?
+74. Explain the STM32F407 clock path: how does an 8 MHz crystal become a 168 MHz SYSCLK?
+75. What are Flash wait states and why must they be set correctly when configuring the CPU clock?
+76. What is the Clock Security System (CSS) and what happens if the external HSE crystal fails?
+77. What is the ARM ITM/SWO and why is it superior to UART for debug printing in an RTOS?
 
 ---
 
 ### ⚙️ Memory Management & Optimizations
 
-74. What is the "Zero `malloc` Policy" and why is it enforced in this project?
-75. What is heap fragmentation and why is it dangerous for a system expected to run for 10 years?
-76. How much RAM does the RTOS overhead consume in this design?
-77. How much Flash does the current application consume vs. the available allocation?
-78. What is Stack Overflow in an RTOS context and how does FreeRTOS detect it?
-79. What is `configCHECK_FOR_STACK_OVERFLOW = 2` and how does the watermark pattern work?
-80. What is `vApplicationStackOverflowHook()` and what should it do when triggered?
-81. What GCC compiler flag do you use for optimization and what does `-O2` specifically do?
-82. What is the Cortex-M4 FPU and how does it accelerate the Peak-Shaving algorithm?
-83. What is `WFI` (Wait For Interrupt) and when does the CPU automatically execute it?
+78. What is the "Zero `malloc` Policy" and why is it enforced in this project?
+79. What is heap fragmentation and why is it dangerous for a system expected to run for 10 years?
+80. How much RAM does the RTOS overhead consume in this design?
+81. How much Flash does the current application consume vs. the available allocation?
+82. What is Stack Overflow in an RTOS context and how does FreeRTOS detect it?
+83. What is `configCHECK_FOR_STACK_OVERFLOW = 2` and how does the watermark pattern work?
+84. What is `vApplicationStackOverflowHook()` and what should it do when triggered?
+85. What GCC compiler flag do you use for optimization and what does `-O2` specifically do?
+86. What is the Cortex-M4 FPU and how does it accelerate the Peak-Shaving algorithm?
+87. What is `WFI` (Wait For Interrupt) and when does the CPU automatically execute it?
 
 ---
 
 ### 🔧 Toolchain, Testing & Debugging
 
-84. Why did you choose STM32CubeIDE over Keil µVision?
-85. What is the GCC ARM Embedded toolchain and what are its 4 compilation phases?
-86. What is the role of `arm-none-eabi-ld` specifically vs. the other toolchain stages?
-87. What is ST-LINK V2 and how do you use SWD for hardware breakpoints?
-88. What is a Logic Analyzer and how did you use it to debug the `DE` pin jitter problem?
-89. What is SEGGER SystemView and what can it prove about task scheduling?
-90. How do you unit-test Peak-Shaving logic that depends on hardware sensor data?
-91. What is "Off-Target Testing" and how does mocking work for RTOS-based embedded code?
-92. What is `Cppcheck` and what does Static Analysis check for in this project?
-93. What is MISRA-C compliance and why is `malloc()` a violation in safety-critical code?
-94. What is Hardware-In-The-Loop (HIL) testing and how did you implement it for this project?
+88. Why did you choose STM32CubeIDE over Keil µVision?
+89. What is the GCC ARM Embedded toolchain and what are its 4 compilation phases?
+90. What is the role of `arm-none-eabi-ld` specifically vs. the other toolchain stages?
+91. What is ST-LINK V2 and how do you use SWD for hardware breakpoints?
+92. What is a Logic Analyzer and how did you use it to debug the `DE` pin jitter problem?
+93. What is SEGGER SystemView and what can it prove about task scheduling?
+94. How do you unit-test Peak-Shaving logic that depends on hardware sensor data?
+95. What is "Off-Target Testing" and how does mocking work for RTOS-based embedded code?
+96. What is `Cppcheck` and what does Static Analysis check for in this project?
+97. What is MISRA-C compliance and why is `malloc()` a violation in safety-critical code?
+98. What is Hardware-In-The-Loop (HIL) testing and how did you implement it for this project?
 
 ---
 
 ### 🏗️ System Design & Architecture Decisions
 
-95. Why was the STM32 RTOS chosen over Embedded Linux (i.MX93) for this controller?
-96. What is the BOM cost difference between an STM32-based EMS and a Linux SoM-based one?
-97. Why was the STM32F407 selected over cheaper alternatives like the STM32F103?
-98. What is Priority Inversion and how did you avoid it without using priority inheritance?
-99. Why are Mutexes banned entirely from this RTOS design?
-100. Why are Software Timers (`osTimerNew`) not used in this project?
-101. Why is `Task_Net` always given the lowest priority in the 3-task hierarchy?
-102. What product safety measures prevent a hacked cloud dashboard from damaging physical hardware?
-103. What is the Independent Watchdog (IWDG) and which task is responsible for refreshing it?
-104. What is Brown-Out Reset (BOR) and what voltage threshold triggers it?
-105. How does the system behave if `Task_Poll` hangs indefinitely?
+99. Why was the STM32 RTOS chosen over Embedded Linux (i.MX93) for this controller?
+100. What is the BOM cost difference between an STM32-based EMS and a Linux SoM-based one?
+101. Why was the STM32F407 selected over cheaper alternatives like the STM32F103?
+102. What is Priority Inversion and how did you avoid it without using priority inheritance?
+103. Why are Mutexes banned entirely from this RTOS design?
+104. Why are Software Timers (`osTimerNew`) not used in this project?
+105. Why is `Task_Net` always given the lowest priority in the 3-task hierarchy?
+106. What product safety measures prevent a hacked cloud dashboard from damaging physical hardware?
+107. What is the Independent Watchdog (IWDG) and which task is responsible for refreshing it?
+108. What is Brown-Out Reset (BOR) and what voltage threshold triggers it?
+109. How does the system behave if `Task_Poll` hangs indefinitely?
+110. Explain the load balancing difference between the i.MX93 `ems-app` and the STM32 `ems-mini-rtos`.
+111. How can you implement time-of-day charging schedules on an STM32 without a filesystem?
+112. Why must you read `GetTime` followed by `GetDate` when using the STM32 RTC?
 
 ---
 
@@ -3002,9 +3163,10 @@ Since this is an always-on edge node, energy management is a background concern.
 
 ---
 
-## 22. Answer Reference Sheet
 
-> 📖 **Usage:** This section contains concise model answers for every question in Section 21. Use it to verify your self-test answers after practicing. Answers are intentionally kept brief — the full technical depth is explained in the relevant numbered section of this guide.
+## 24. Answer Reference Sheet
+
+> 📖 **Usage:** This section contains concise model answers for every question in Section 23. Use it to verify your self-test answers after practicing. Answers are intentionally kept brief — the full technical depth is explained in the relevant numbered section of this guide.
 
 ---
 
@@ -3176,192 +3338,96 @@ Since this is an always-on edge node, energy management is a background concern.
 
 **A73.** CCM (Core Coupled Memory) RAM is a 64KB SRAM bus directly connected to the Cortex-M4 data bus, bypassing the main AHB system matrix. Zero wait states vs. 1–2 wait states on normal SRAM. We placed `Task_Ctrl`'s stack there because it runs the floating-point peak-shaving algorithm — every instruction cycle saved translates directly to faster control loop response.
 
+**A74.** The HSE 8MHz crystal provides the stable reference. The PLL multiplies it: `(HSE / 8) * 336 / 2 = 168 MHz`. PLL_M (8) targets a 1MHz input to the VCO; PLL_N (336) brings it to 336MHz; PLL_P (2) produces the 168MHz SYSCLK.
+
+**A75.** Flash is slower than the CPU. At 168MHz, we must set `FLASH_LATENCY_5` (5 wait states). If set too low, the CPU attempts to fetch instructions faster than the Flash transistors can toggle, resulting in corrupted opcodes and immediate Hard Faults.
+
+**A76.** The Clock Security System (CSS) is a hardware monitor. If the external HSE crystal fails (e.g., physical fracture), the CSS hardware instantly switches the CPU to the internal 16MHz HSI oscillator and fires a Non-Maskable Interrupt (NMI). This prevents a total system freeze.
+
+**A77.** ITM (Instrumentation Trace Macrocell) streams debug data over the SWO pin at 4MHz+ asynchronously. It is superior to UART because it uses dedicated ARM silicon hardware, requires only 1 CPU cycle to send a byte (non-blocking), and doesn't consume a UART peripheral.
+
 ---
 
 ### ⚙️ Memory Management & Optimizations
 
-**A74.** All FreeRTOS objects (queues, semaphores, task stacks) are allocated once during boot using `osMessageQueueNew()`, `osSemaphoreNew()`, and `osThreadNew()`. After `osKernelStart()`, `malloc()` is never called again. This is enforced via `heap_4.c` usage and `configASSERT(pointer != NULL)` on every allocation.
+**A78.** All FreeRTOS objects (queues, semaphores, task stacks) are allocated once during boot using `osMessageQueueNew()`, `osSemaphoreNew()`, and `osThreadNew()`. After `osKernelStart()`, `malloc()` is never called again. This is enforced via `heap_4.c` usage and `configASSERT(pointer != NULL)` on every allocation.
 
-**A75.** Repeated `malloc()`/`free()` cycles fragment the heap over time — small allocations leave holes that are too small for future requests, causing eventual allocation failures. For a 10-year deployed industrial product, this would cause unpredictable crashes months into operation. Static allocation eliminates fragmentation entirely.
+**A79.** Repeated `malloc()`/`free()` cycles fragment the heap over time — small allocations leave holes that are too small for future requests, causing eventual allocation failures. For a 10-year deployed industrial product, this would cause unpredictable crashes months into operation. Static allocation eliminates fragmentation entirely.
 
-**A76.** Approximately **~15KB**: each of 3 task stacks (3 × 2KB), Task Control Blocks (3 × ~88 bytes), Queue storage buffers (Queue_Data: 32×~20 bytes, Queue_Cmd: 16×8 bytes, queueCanRx: 16×16 bytes), plus the FreeRTOS kernel internal structures.
+**A80.** Approximately **~15KB**: each of 3 task stacks (3 × 2KB), Task Control Blocks (3 × ~88 bytes), Queue storage buffers (Queue_Data: 32×~20 bytes, Queue_Cmd: 16×8 bytes, queueCanRx: 16×16 bytes), plus the FreeRTOS kernel internal structures.
 
-**A77.** The FreeRTOS application + HAL drivers + FreeRTOS kernel compiles to approximately **~70KB**. The Bank 1 partition is 384KB. We are using less than 20% of the available Flash — leaving 314KB of headroom for future feature growth.
+**A81.** The FreeRTOS application + HAL drivers + FreeRTOS kernel compiles to approximately **~70KB**. The Bank 1 partition is 384KB. We are using less than 20% of the available Flash — leaving 314KB of headroom for future feature growth.
 
-**A78.** Stack Overflow occurs when a task's local function call chain exceeds its allocated stack space, writing into adjacent RAM. In an RTOS, this silently corrupts another task's variables or stack, causing random, extremely hard to debug crashes. FreeRTOS detects it using a watermark pattern.
+**A82.** Stack Overflow occurs when a task's local function call chain exceeds its allocated stack space, writing into adjacent RAM. In an RTOS, this silently corrupts another task's variables or stack, causing random, extremely hard to debug crashes. FreeRTOS detects it using a watermark pattern.
 
-**A79.** Setting `configCHECK_FOR_STACK_OVERFLOW = 2` tells FreeRTOS to paint the last 20 bytes of every task's stack with the pattern `0xA5A5A5A5` at boot. On every context switch, the kernel checks whether those bytes are still intact. If any byte changed, the stack overflowed from that task into the guarded zone.
+**A83.** Setting `configCHECK_FOR_STACK_OVERFLOW = 2` tells FreeRTOS to paint the last 20 bytes of every task's stack with the pattern `0xA5A5A5A5` at boot. On every context switch, the kernel checks whether those bytes are still intact. If any byte changed, the stack overflowed from that task into the guarded zone.
 
-**A80.** `vApplicationStackOverflowHook(TaskHandle_t, char* pcTaskName)` is called by the kernel when it detects the watermark has been corrupted. In production, it should: log the offending task name, trigger a controlled hardware reset via `NVIC_SystemReset()`, and increment a persistent crash counter in non-volatile memory for field diagnostics.
+**A84.** `vApplicationStackOverflowHook(TaskHandle_t, char* pcTaskName)` is called by the kernel when it detects the watermark has been corrupted. In production, it should: log the offending task name, trigger a controlled hardware reset via `NVIC_SystemReset()`, and increment a persistent crash counter in non-volatile memory for field diagnostics.
 
-**A81.** `-O2` tells GCC to apply aggressive optimizations without sacrificing strict correctness: loop unrolling (avoids branch overhead), instruction scheduling (reorders instructions to avoid pipeline stalls), constant folding (evaluates compile-time math at compile time), and dead code elimination. Binary size increases slightly but execution speed improves significantly.
+**A85.** `-O2` tells GCC to apply aggressive optimizations without sacrificing strict correctness: loop unrolling (avoids branch overhead), instruction scheduling (reorders instructions to avoid pipeline stalls), constant folding (evaluates compile-time math at compile time), and dead code elimination. Binary size increases slightly but execution speed improves significantly.
 
-**A82.** The Cortex-M4F contains a dedicated hardware Floating-Point Unit (FPU). With `__FPU_PRESENT = 1` and the `-mfpu=fpv4-sp-d16` GCC flag, float operations like `gridPowerW * 0.001f` execute in **1 clock cycle** natively. Without the FPU, the compiler generates 20–50 software library instructions emulating the same operation, consuming valuable real-time budget.
+**A86.** The Cortex-M4F contains a dedicated hardware Floating-Point Unit (FPU). With `__FPU_PRESENT = 1` and the `-mfpu=fpv4-sp-d16` GCC flag, float operations like `gridPowerW * 0.001f` execute in **1 clock cycle** natively. Without the FPU, the compiler generates 20–50 software library instructions emulating the same operation, consuming valuable real-time budget.
 
-**A83.** `WFI` (Wait For Interrupt) is a native ARM Cortex assembly instruction that halts the ALU clock tree and most bus clocks until any hardware interrupt fires. FreeRTOS's Idle Task executes `WFI` automatically whenever no task is Ready. The CPU draws single-digit milliamps in this state vs. ~100mA when actively executing.
+**A87.** `WFI` (Wait For Interrupt) is a native ARM Cortex assembly instruction that halts the ALU clock tree and most bus clocks until any hardware interrupt fires. FreeRTOS's Idle Task executes `WFI` automatically whenever no task is Ready. The CPU draws single-digit milliamps in this state vs. ~100mA when actively executing.
 
 ---
 
 ### 🔧 Toolchain, Testing & Debugging
 
-**A84.** STM32CubeIDE is free (vs. Keil's thousands-of-dollars per license), cross-platform (Linux/Mac/Windows), uses open-source GCC (enabling headless CI/CD Docker builds), and integrates directly with STM32CubeMX for graphical peripheral configuration. Keil uses a proprietary compiler requiring Windows and physical USB license dongles.
+**A88.** STM32CubeIDE is free (vs. Keil's thousands-of-dollars per license), cross-platform (Linux/Mac/Windows), uses open-source GCC (enabling headless CI/CD Docker builds), and integrates directly with STM32CubeMX for graphical peripheral configuration. Keil uses a proprietary compiler requiring Windows and physical USB license dongles.
 
-**A85.** Four phases: ① **Preprocessor** — strips comments, expands `#define` macros, inlines `#include` headers. ② **Compiler** — translates C to ARM assembly (`.s`). ③ **Assembler** — converts assembly to machine code object files (`.o`). ④ **Linker** — maps all `.o` files + libraries to physical memory addresses per the linker script, producing the final `.elf`/`.bin`.
+**A89.** Four phases: ① **Preprocessor** — strips comments, expands `#define` macros, inlines `#include` headers. ② **Compiler** — translates C to ARM assembly (`.s`). ③ **Assembler** — converts assembly to machine code object files (`.o`). ④ **Linker** — maps all `.o` files + libraries to physical memory addresses per the linker script, producing the final `.elf`/`.bin`.
 
-**A86.** `arm-none-eabi-ld` (the Linker) combines all compiled object files, resolves external symbol references (e.g., `HAL_UART_Transmit` defined in the HAL library), places code sections at the physical hardware addresses defined in `STM32F407VGTX_FLASH.ld`, and outputs the executable binary. Without it, the compiled fragments would have no knowledge of where they live in physical silicon.
+**A90.** `arm-none-eabi-ld` (the Linker) combines all compiled object files, resolves external symbol references (e.g., `HAL_UART_Transmit` defined in the HAL library), places code sections at the physical hardware addresses defined in `STM32F407VGTX_FLASH.ld`, and outputs the executable binary. Without it, the compiled fragments would have no knowledge of where they live in physical silicon.
 
-**A87.** ST-LINK V2 is a USB debug probe. It connects to the STM32's SWD (Serial Wire Debug) 2-pin interface (SWDIO + SWDCLK). Via GDB inside STM32CubeIDE, it can: set hardware breakpoints (CPU halts when PC reaches a specific instruction), inspect the full register file and RAM, step through code single-instruction at a time, and read/write memory live while the RTOS is running.
+**A91.** ST-LINK V2 is a USB debug probe. It connects to the STM32's SWD (Serial Wire Debug) 2-pin interface (SWDIO + SWDCLK). Via GDB inside STM32CubeIDE, it can: set hardware breakpoints (CPU halts when PC reaches a specific instruction), inspect the full register file and RAM, step through code single-instruction at a time, and read/write memory live while the RTOS is running.
 
-**A88.** A Logic Analyzer clamps physical probes onto copper traces. We probe PA2 (UART TX), PA3 (UART RX), and PD4 (DE pin). The analyzer records the exact timing of every bit transition. We can measure to nanosecond precision: does the DE pin drop LOW immediately after the last TX bit? If not, we visualize exactly how many microseconds of jitter exist and confirm after our ISR fix that it is zero.
+**A92.** A Logic Analyzer clamps physical probes onto copper traces. We probe PA2 (UART TX), PA3 (UART RX), and PD4 (DE pin). The analyzer records the exact timing of every bit transition. We can measure to nanosecond precision: does the DE pin drop LOW immediately after the last TX bit? If not, we visualize exactly how many microseconds of jitter exist and confirm after our ISR fix that it is zero.
 
-**A89.** SEGGER SystemView records a microsecond-resolution timeline of every FreeRTOS event: task switches, ISR entries/exits, queue operations. It runs via SWD without halting the CPU. We can visually prove: `Task_Ctrl` shows 0% CPU consumption until `Queue_Data` triggers it, confirm context switch latency is <1µs, and verify no task is starving.
+**A93.** SEGGER SystemView records a microsecond-resolution timeline of every FreeRTOS event: task switches, ISR entries/exits, queue operations. It runs via SWD without halting the CPU. We can visually prove: `Task_Ctrl` shows 0% CPU consumption until `Queue_Data` triggers it, confirm context switch latency is <1µs, and verify no task is starving.
 
-**A90.** We use Off-Target testing (Ceedling/Unity). The `Task_Ctrl` peak-shaving logic only consumes a `SystemState_t` struct. We compile the algorithm on a Linux PC, create a Mock C function that injects fake structs (e.g., `gridPowerW = 5000`, `batterySoC = 80`), and assert the output inverter command matches our expected calculation — zero hardware required.
+**A94.** We use Off-Target testing (Ceedling/Unity). The `Task_Ctrl` peak-shaving logic only consumes a `SystemState_t` struct. We compile the algorithm on a Linux PC, create a Mock C function that injects fake structs (e.g., `gridPowerW = 5000`, `batterySoC = 80`), and assert the output inverter command matches our expected calculation — zero hardware required.
 
-**A91.** Off-Target testing means running embedded C code on a Linux/MacOS build system (not the target MCU). Mocking replaces hardware-dependent functions (e.g., `HAL_UART_Transmit`, `osMessageQueuePut`) with fake stub implementations that record what they were called with. The business logic can then be unit-tested against known inputs without any physical hardware.
+**A95.** Off-Target testing means running embedded C code on a Linux/MacOS build system (not the target MCU). Mocking replaces hardware-dependent functions (e.g., `HAL_UART_Transmit`, `osMessageQueuePut`) with fake stub implementations that record what they were called with. The business logic can then be unit-tested against known inputs without any physical hardware.
 
-**A92.** `Cppcheck` is a static analysis tool for C/C++. It analyzes source code without compiling/running it and reports: array out-of-bounds accesses, uninitialized variable reads, null pointer dereferences, memory leaks, unreachable code, and MISRA-C violations. We run it automatically on every Pull Request via GitHub Actions.
+**A96.** `Cppcheck` is a static analysis tool for C/C++. It analyzes source code without compiling/running it and reports: array out-of-bounds accesses, uninitialized variable reads, null pointer dereferences, memory leaks, unreachable code, and MISRA-C violations. We run it automatically on every Pull Request via GitHub Actions.
 
-**A93.** MISRA-C is a set of programming rules for safety-critical embedded C code (originally from the Motor Industry Software Reliability Association). `malloc()` is a violation because it introduces non-deterministic timing (heap allocation can be slow or fail at runtime) and risks heap fragmentation in long-running systems — both unacceptable in certified industrial safety applications.
+**A97.** MISRA-C is a set of programming rules for safety-critical embedded C code (originally from the Motor Industry Software Reliability Association). `malloc()` is a violation because it introduces non-deterministic timing (heap allocation can be slow or fail at runtime) and risks heap fragmentation in long-running systems — both unacceptable in certified industrial safety applications.
 
-**A94.** For HIL testing, a PC with RS-485 adapters physically connects to the STM32 board via the actual copper interface. A Python script replays real inverter Modbus telegram captures at correct baud rates. Simultaneously, a second script monitors the MQTT Cloud broker output. We verify: the correct JSON telemetry appears within the expected 300ms polling period, and inverter write commands are issued at the correct wattage when simulated grid power exceeds the limit.
+**A98.** For HIL testing, a PC with RS-485 adapters physically connects to the STM32 board via the actual copper interface. A Python script replays real inverter Modbus telegram captures at correct baud rates. Simultaneously, a second script monitors the MQTT Cloud broker output. We verify: the correct JSON telemetry appears within the expected 300ms polling period, and inverter write commands are issued at the correct wattage when simulated grid power exceeds the limit.
 
 ---
 
 ### 🏗️ System Design & Architecture Decisions
 
-**A95.** Embedded Linux (i.MX93) requires DDR RAM (~$15), eMMC storage (~$8), PMIC (~$5), and a Linux boot time of 30+ seconds. It cannot guarantee hard real-time sub-millisecond response. The STM32F407 costs ~$6, boots in 300ms, requires zero external memory, and provides deterministic hardware interrupt response. For a pure hardware-control edge node, RTOS is the correct choice.
+**A99.** Embedded Linux (i.MX93) requires DDR RAM (~$15), eMMC storage (~$8), PMIC (~$5), and a Linux boot time of 30+ seconds. It cannot guarantee hard real-time sub-millisecond response. The STM32F407 costs ~$6, boots in 300ms, requires zero external memory, and provides deterministic hardware interrupt response. For a pure hardware-control edge node, RTOS is the correct choice.
 
-**A96.** Linux SoM-based EMS: ~$100+ per unit (SoM + DDR + eMMC + PMIC + carrier board). STM32-based EMS: ~$25 per unit as detailed in the BOM section. At 10,000 units, this is a **$750,000 difference in hardware COGS**.
+**A100.** Linux SoM-based EMS: ~$100+ per unit (SoM + DDR + eMMC + PMIC + carrier board). STM32-based EMS: ~$25 per unit as detailed in the BOM section. At 10,000 units, this is a **$750,000 difference in hardware COGS**.
 
-**A97.** The STM32F103 (Cortex-M3) has no FPU, only 128KB Flash (insufficient for dual-bank OTA), only 20KB RAM (insufficient for FreeRTOS + queues + network buffers), and a single basic DMA controller. The F407 provides: hardware FPU (for float peak-shaving), 1MB Flash (dual-bank OTA), 192KB RAM, dual DMA controllers, and hardware CAN — all required by this design.
+**A101.** The STM32F103 (Cortex-M3) has no FPU, only 128KB Flash (insufficient for dual-bank OTA), only 20KB RAM (insufficient for FreeRTOS + queues + network buffers), and a single basic DMA controller. The F407 provides: hardware FPU (for float peak-shaving), 1MB Flash (dual-bank OTA), 192KB RAM, dual DMA controllers, and hardware CAN — all required by this design.
 
-**A98.** Priority Inversion: a Low-priority task holds a Mutex that a High-priority task needs, but a Medium-priority task runs instead — the High-priority task is indefinitely delayed. Solution: we **banned Mutexes entirely** and exclusively use Queues, which pass data by value (copying the struct). No shared memory ownership means no Priority Inversion is structurally possible.
+**A102.** Priority Inversion: a Low-priority task holds a Mutex that a High-priority task needs, but a Medium-priority task runs instead — the High-priority task is indefinitely delayed. Solution: we **banned Mutexes entirely** and exclusively use Queues, which pass data by value (copying the struct). No shared memory ownership means no Priority Inversion is structurally possible.
 
-**A99.** Mutexes create shared ownership of a memory region, opening the door to Priority Inversion and Deadlocks. Instead, every inter-task data transfer is a value copy via `osMessageQueuePut()`. Each task owns its own private copy of data. Race conditions on shared memory become impossible by design.
+**A103.** Mutexes create shared ownership of a memory region, opening the door to Priority Inversion and Deadlocks. Instead, every inter-task data transfer is a value copy via `osMessageQueuePut()`. Each task owns its own private copy of data. Race conditions on shared memory become impossible by design.
 
-**A100.** Software Timers run inside a hidden FreeRTOS Daemon Task (`tmrtask`) at a fixed priority. This creates an opaque execution context that obscures when your timer callback actually runs relative to your application tasks. We prefer explicit `osDelay()` inside dedicated task loops — the execution timing is transparent, debuggable, and directly priority-controlled.
+**A104.** Software Timers run inside a hidden FreeRTOS Daemon Task (`tmrtask`) at a fixed priority. This creates an opaque execution context that obscures when your timer callback actually runs relative to your application tasks. We prefer explicit `osDelay()` inside dedicated task loops — the execution timing is transparent, debuggable, and directly priority-controlled.
 
-**A101.** Cloud networking is the least safety-critical function. A 500ms delay in publishing telemetry or receiving a cloud command is acceptable. A 500ms delay in reading the Grid Meter or commanding the inverter could cause physical hardware damage. By giving `Task_Net` the lowest priority, all failure modes in the network layer are isolated from physical safety functions.
+**A105.** Cloud networking is the least safety-critical function. A 500ms delay in publishing telemetry or receiving a cloud command is acceptable. A 500ms delay in reading the Grid Meter or commanding the inverter could cause physical hardware damage. By giving `Task_Net` the lowest priority, all failure modes in the network layer are isolated from physical safety functions.
 
-**A102.** All cloud commands received by `Task_Net` are parsed into a `CloudCommand_t` struct. Before `Task_Ctrl` applies any value, it clamps the command against hard-coded hardware limits (`MIN_INVERTER_WATTAGE`, `MAX_BATTERY_CHARGE_RATE`). Even if a hacker sends `{\"val\": 999999}`, the firmware mathematically truncates it to the maximum safe value before passing the command to the hardware driver.
+**A106.** All cloud commands received by `Task_Net` are parsed into a `CloudCommand_t` struct. Before `Task_Ctrl` applies any value, it clamps the command against hard-coded hardware limits (`MIN_INVERTER_WATTAGE`, `MAX_BATTERY_CHARGE_RATE`). Even if a hacker sends `{\"val\": 999999}`, the firmware mathematically truncates it to the maximum safe value before passing the command to the hardware driver.
 
-**A103.** The IWDG (Independent Watchdog) is a countdown hardware timer running on the STM32's dedicated 32kHz LSI clock — completely independent of the main 168MHz system clock and FreeRTOS. `Task_Poll` calls `HAL_IWDG_Refresh()` on every loop iteration. If `Task_Poll` freezes, the IWDG counts down to zero and triggers a full CPU hardware reset.
+**A107.** The IWDG (Independent Watchdog) is a countdown hardware timer running on the STM32's dedicated 32kHz LSI clock — completely independent of the main 168MHz system clock and FreeRTOS. `Task_Poll` calls `HAL_IWDG_Refresh()` on every loop iteration. If `Task_Poll` freezes, the IWDG counts down to zero and triggers a full CPU hardware reset.
 
-**A104.** BOR (Brown-Out Reset) is a hardware voltage monitor. We configure BOR Level 3 (threshold ≈ 2.7V). If the VDD supply drops below 2.7V (from a grid fault, or a failing power supply), the BOR circuit holds the CPU in reset. This prevents the CPU from writing corrupted data to Flash under low voltage, which can permanently brick the device.
+**A108.** BOR (Brown-Out Reset) is a hardware voltage monitor. We configure BOR Level 3 (threshold ≈ 2.7V). If the VDD supply drops below 2.7V (from a grid fault, or a failing power supply), the BOR circuit holds the CPU in reset. This prevents the CPU from writing corrupted data to Flash under low voltage, which can permanently brick the device.
 
-**A105.** If `Task_Poll` hangs (e.g., stuck waiting forever on a dead semaphore or in an infinite loop), two things happen: ① `Task_Ctrl` never receives new telemetry on `Queue_Data` and enters indefinite Blocked state — inverter commands stop, the system enters safe idle. ② `Task_Poll` stops calling `HAL_IWDG_Refresh()`. Within 2 seconds, the IWDG hardware timer expires and triggers a full CPU reset, returning the system to normal operation automatically.
+**A109.** If `Task_Poll` hangs (e.g., stuck waiting forever on a dead semaphore or in an infinite loop), two things happen: ① `Task_Ctrl` never receives new telemetry on `Queue_Data` and enters indefinite Blocked state — inverter commands stop, the system enters safe idle. ② `Task_Poll` stops calling `HAL_IWDG_Refresh()`. Within 2 seconds, the IWDG hardware timer expires and triggers a full CPU reset, returning the system to normal operation automatically.
 
----
+**A110.** The i.MX93 `ems-app` uses a predictive, scheduled strategy with massive JSON timeslots and localized Redis databases. The STM32 `ems-mini-rtos` uses a deterministic, instantaneous strategy, making safety-clamped decisions strictly based on real-time telemetry with zero filesystem overhead.
 
-## 22. Load Balancing & Time-Based Control
+**A111.** By using the STM32's hardware RTC and an internet-synced NTP client. `Task_Net` fetches the time via UDP from an NTP server, syncs the internal RTC, and `Task_Ctrl` compares the current `RTC_TimeTypeDef` against hardcoded or MQTT-pushed "Time-of-Use" threshold variables.
 
-### The i.MX93 (`ems-app`) vs. STM32 (`ems-mini-rtos`) Load Balancing Logic
-
-The load balancing philosophies drastically differ between the flagship Embedded Linux CEMS and the RTOS mini edge-node counterpart.
-
-#### `ems-app` (i.MX93) Strategy: Predictive & Scheduled
-The Linux-based architecture leverages its vast RAM (GBs) and persistent local database (Redis broker) to run a continuous, complex 2-second decision loop (`hems_control.cpp`).
-*   **Time Schedules (Timeslots):** The system relies heavily on `hems_timeslot_t` arrays defined by the user. These schedules command explicit Import, Export, and target Power Goals for specific times of the day.
-*   **Dynamic Phase Distribution:** It fluidly alternates among four modes (`IDLE`, `ECO_BALANCING`, `CHARGING`, `DISCHARGING`), precisely distributing power across 3 phases (Peak Shaving or Valley Filling) based on the instantaneous grid conditions combined with the current timeslot bounds.
-*   **Programmable Equations:** Uses `logic.cpp` to evaluate on-the-fly user-defined math equations to map system behavior dynamically without recompiling.
-
-#### `ems-mini-rtos` (STM32) Strategy: Deterministic & Instantaneous
-The RTOS version completely lacks the storage/RAM to hold massive JSON databases of predictive timeslots and lacks a Python runtime to seamlessly manage UI scheduling data.
-*   **No Multi-Day Predictive Timeslots:** Complex schedules cannot be generated or stored locally out-of-the-box.
-*   **Instantaneous Control:** Decisions are made strictly based on raw physical telemetry pulled during `Task_Poll`. If the Grid Meter reads that import exceeds a hardcoded `MaxLimit`, `Task_Ctrl` instantly calculates the delta and commands the inverter to discharge.
-*   **Hardcoded Protection:** Safety overrides—like battery charging current limits scaling down during high temperatures—are statically compiled in C rather than dynamic logic evaluations.
-
-**RTOS Instantaneous Control Loop Flow:**
-```mermaid
-stateDiagram-v2
-    direction LR
-    
-    state "Task_Poll (High Priority)" as Task_Poll {
-        Rx_DMA --> Parse_Struct
-        Parse_Struct --> Push_Queue
-    }
-    
-    state "Task_Ctrl (Medium Priority)" as Task_Ctrl {
-        Pop_Queue --> Math_Clamp
-        Math_Clamp --> Check_Failsafes
-        Check_Failsafes --> Dispatch_Tx
-    }
-    
-    Grid_Meter --> Task_Poll : Modbus Telegram (RS-485)
-    Task_Poll --> Task_Ctrl : SystemState_t (0 Wait States via Queue)
-    Task_Ctrl --> Inverter : Modbus Command (Discharge / Charge)
-```
-
-### Is there Time-Based Control in the RTOS setup?
-
-Natively, out of the box, the FreeRTOS EMS project **lacks complex absolute time-of-day control (like Linux `cron`)** because microcontrollers do not have an inherently synced system clock upon boot. 
-
-However, **it is entirely possible to add precise time-based control** to the RTOS project depending on the exact requirements. Here is how it can be implemented in detail:
-
-#### 1. Internal Hardware RTC (Real-Time Clock) & Backup Registers
-The STM32F407 silicon features a robust internal RTC peripheral that spans an isolated power domain. 
-*   **Implementation:** 
-    1.  Enable the RTC in STM32CubeIDE (`System Core > RTC`).
-    2.  Supply a 32.768 kHz quartz crystal to the `LSE` (Low-Speed External) oscillator pins (`PC14` and `PC15`). This provides absolute timing accuracy.
-    3.  Route a standard CR2032 coin-cell battery to the `VBAT` physical pin. Even if the main 3.3V system power fails, `VBAT` keeps the RTC ticking continuously.
-
-*   **Controlling the RTC (Reading and Writing):**
-    Unlike standard variables, the RTC time is stored in protected hardware registers to prevent accidental corruption. To safely interact with the HAL API, you must always read or write **both Time and Date** sequentially.
-
-    **Example: Writing the Time (Setting the Clock)**
-    ```c
-    RTC_TimeTypeDef sTime = {0};
-    RTC_DateTypeDef sDate = {0};
-
-    // 1. Set Time (e.g. 14:30:00)
-    sTime.Hours = 14;
-    sTime.Minutes = 30;
-    sTime.Seconds = 0;
-    // Format is BIN explicitly (not BCD)
-    HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
-
-    // 2. Set Date (Must be set together!)
-    sDate.Year = 24; // 2024
-    sDate.Month = RTC_MONTH_OCTOBER;
-    sDate.Date = 15;
-    HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
-    ```
-
-    **Example: Reading the Time (Executing Logic)**
-    *Critical Note:* You **must** read `GetTime` followed immediately by `GetDate`. Reading the Time locks the hardware shadow registers so you get a consistent snapshot; reading the Date unlocks them.
-    ```c
-    RTC_TimeTypeDef currTime = {0};
-    RTC_DateTypeDef currDate = {0};
-
-    // Read Time FIRST, then Date to unlock hardware registers
-    HAL_RTC_GetTime(&hrtc, &currTime, RTC_FORMAT_BIN);
-    HAL_RTC_GetDate(&hrtc, &currDate, RTC_FORMAT_BIN); 
-
-    // Execute Time-Of-Use Load Balancing logic inside Task_Ctrl
-    if (currTime.Hours >= 2 && currTime.Hours < 5) {
-        set_inverter_mode(OP_MODE_FORCE_CHARGE); // Valley filling at 2AM
-    }
-    ```
-
-*   **Hardware Alarms & Battery-Backed SRAM:** 
-    Beyond timekeeping, the RTC peripheral block provides configuring `RTC Alarm A` hardware interrupts, allowing `Task_Ctrl` to sleep at 0% CPU and wake up *exactly* at a specific second. Additionally, this domain grants access to **20 Backup Registers** (80 bytes total). These 32-bit registers survive system reboots and power losses (powered by `VBAT`), making them the perfect place to safely store a "Crash Reason" before triggering a hardware watchdog reset.
-
-#### 2. FreeRTOS Software Timers (For Relative Delays)
-If the system does not care about the "Time of Day" (e.g., 2:00 PM) but only cares about "Duration" (e.g., "Charge for exactly 2 hours after a command is received"), we use the FreeRTOS Timer API.
-*   **Implementation:** Call `xTimerCreate()` and `xTimerStart()`. 
-*   **Logic:** The FreeRTOS Daemon Task (`tmrtask`) will run a callback exactly after the specified thousands of FreeRTOS ticks have elapsed. This is highly RAM efficient and requires no hardware RTC.
-
-#### 3. Cloud Synchronization (NTP via W5500)
-If the STM32 has an active internet connection through the W5500 ethernet chip, time schedules can be kept incredibly accurate without a coin-cell battery.
-*   **Implementation:** Modify `Task_Net` to routinely execute a lightweight UDP socket request to an NTP pool (e.g., `pool.ntp.org`) via the W5500.
-*   **Logic:** Upon parsing the UNIX timestamp from the NTP server, `Task_Net` updates the STM32's internal RTC. 
-*   **Dynamic Schedules:** With NTP synced, the Cloud (via MQTT) can push a lightweight JSON array to the STM32 (e.g., `[{"start":1704067200,"mode":1}]`). `Task_Ctrl` stores this tiny array in SRAM and evaluates it continuously against the NTP-synced clock, effectively reproducing the `ems-app` timeslot behavior on a micro-scale.
-
-#### 4. External I2C RTC (e.g., DS3231)
-For the highest absolute safety in environments spanning extreme temperatures where the internal STM32 RTC might drift, an external temperature-compensated RTC (DS3231) is wired via I2C. `Task_Poll` reads this module every few seconds to guarantee hard compliance with utility grid Time-of-Use tariffs.
+**A112.** Reading `HAL_RTC_GetTime` locks the hardware shadow registers to ensure a consistent snapshot of the current second/minute/hour. Reading `HAL_RTC_GetDate` unlocks them. If you skip reading the Date, the shadow registers remain locked, and subsequent Time reads will return the same stale value forever.
 
 ---
-<div align="center">
-<i>Designed and Engineered by the EMS Firmware Team. Strictly Confidential.</i>
-</div>
+
+
