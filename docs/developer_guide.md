@@ -1003,10 +1003,17 @@ sequenceDiagram
    * `Task_Net` on the STM32 drives the **SPI Bus** (SCK, MISO, MOSI). It sends a command over MOSI saying "Read Socket 0 Buffer". 
    * The W5500 streams the `.bin` bytes out over the MISO line. `Task_Net` catches them in a 1 Kilobyte temporary RAM array (`chunkBuffer`).
    * Finally, `Task_Net` calls `HAL_FLASH_Program()`, commanding the STM32 silicon to physically burn that 1KB RAM array permanently into the **Bank 2 Flash** transistors. This loops until the file is complete.
-6. **Validation Trailer:** Once fully downloaded, we write a `16-Byte "Magic Trailer"` string to the very end of the Flash sector. This trailer is the definitive signal to the bootloader.
-7. **Physical Reboot:** `Task_Net` fires a native ARM reset vector via `NVIC_SystemReset()`.
-8. **Secure Boot Handoff:** MCUboot boots from `0x08000000`. It detects the Magic Trailer. It reads its own embedded **Public Key**, bypassing FreeRTOS, and runs the intensive elliptic curve math over Bank 2 to verify the signature. 
-9. **Final Decimation:** If verified, MCUboot obliterates Bank 1, copies the new software over, and jumps to the application. If verification **fails**, MCUboot rejects the image instantly and resumes the old Bank 1 firmware, preventing malicious code execution!
+6. **Validation Trailer:** Once the final chunk is downloaded, `Task_Net` writes a precisely formatted **"Magic Trailer"** (created by the python `imgtool` utility originally) to the very end of the Flash sector. 
+   * This trailer is not just a random string; it contains the TLVs (Type-Length-Values) holding the SHA-256 hash of the binary and the ECDSA P-256 cryptographic signature itself.
+   * It also forces the `image_ok` flag to `0x01` (pending) by writing specific hexadecimal values (like `0x7767AF...`) to the final 16 bytes of the slot. This explicit byte-pattern is the definitive hardware signal telling the bootloader: *"A new, completed update is sitting in Bank 2 ready for review."*
+7. **Physical Reboot:** `Task_Net` flushes the SPI buffers and fires a native ARM hardware reset vector via `NVIC_SystemReset()`.
+8. **Secure Boot Handoff:** The STM32 hardware always boots physically from address `0x08000000`. This is where **MCUboot** lives. 
+   * MCUboot wakes up (completely bypassing FreeRTOS) and scans the end of the Bank 2 flash sectors looking for the Magic Trailer.
+   * Finding the trailer, it reads the appended Cryptographic Signature.
+   * MCUboot then reads its own **embedded ECDSA Public Key** (which was permanently compiled into the bootloader binary at the factory).
+   * It executes the intensive elliptic curve mathematics over the entire Bank 2 payload, generating a local SHA-256 hash and mathematically validating it against the appended signature using the Public Key. 
+   * **This is the essence of Secure Boot:** If a single bit in Bank 2 was corrupted during download, or if a hacker injected malicious code without possessing our offline Private Key, the mathematical validation instantly fails.
+9. **Final Decimation:** If the cryptography succeeds, MCUboot confidently obliterates Bank 1, copies the pristine Bank 2 software over, and jumps the PC (Program Counter) to the new application entry point. If verification **fails**, MCUboot rejects the image instantly, scrubs Bank 2, and blindly boots the old safe Bank 1 firmware, preventing a bricked or compromised gateway!
 
 ### 6.4 Secure Boot Key Provisioning: Where Does the Key Live & Can It Be Changed?
 
