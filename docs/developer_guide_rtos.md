@@ -275,13 +275,59 @@ Imagine this real-world scenario in our EMS:
 
 **The question:** Which ISR (Interrupt Service Routine) gets to run first? If we pick wrong, the CAN FIFO could overflow (only 3 frames deep in silicon) and we'd lose a critical battery protection message.
 
-#### Software-Only Solution (What Cheap MCUs Do)
+#### What Non-NVIC Controllers Do (8-bit AVR, PIC, Simple ARM Cortex-M0)
 
-On microcontrollers without an NVIC (or with primitive interrupt controllers), the silicon uses **fixed hardware vector tables** where interrupt priority is determined by the physical memory address of the ISR in the vector table. This is inflexible:
+**Important Clarification:** Microcontrollers without an NVIC (or with very basic interrupt controllers) typically have **NO programmable interrupt priority at all**.
 
-- **Priority is fixed at compile time** — you can't dynamically adjust it.
-- **No preemption** — if the Modbus ISR is already running and the CAN interrupt fires, the CPU must wait until the entire Modbus handler finishes (could be 100+ microseconds) before servicing CAN. The CAN FIFO overflows and data is lost.
-- **Software arbitration required** — the RTOS must manually check flags and decide what to do, adding latency and jitter.
+**Three Common Architectures:**
+
+**1. Fixed Priority by Vector Table Position (8-bit AVR, PIC16/PIC18)**
+
+These chips use **positional priority**—the interrupt that appears first in the hardware vector table wins:
+
+```
+Memory Address    IRQ Vector           Priority (Unchangeable)
+0x0000           RESET                 (highest - hardware enforced)
+0x0002           External INT0         Priority 1 (always beats everything below)
+0x0004           Timer0 Overflow       Priority 2
+0x0006           UART RX               Priority 3
+0x0008           ADC Complete          Priority 4 (lowest)
+```
+
+- **✗ Cannot be changed:** If you need UART to beat Timer0, you're out of luck—it's burned into silicon.
+- **✗ No nested interrupts:** If Timer0 ISR is running and UART fires, UART must wait until Timer0 completely finishes.
+- **✗ No hardware preemption:** All interrupt priority decisions must be made in software using flags.
+
+**Example Problem:**
+```c
+// Timer0 ISR is running (doing 500 cycles of work)
+ISR(TIMER0_OVF_vect) {
+    for (int i = 0; i < 100; i++) {
+        process_data[i] = calculate(i);  // Takes 500 CPU cycles
+    }
+}
+
+// Meanwhile, critical UART byte arrives from CAN transceiver
+// UART hardware sets IRQ flag, but CPU CANNOT preempt Timer0
+// UART data sits in 1-byte buffer for 500 cycles...
+// If another byte arrives before Timer0 finishes → OVERFLOW, data lost!
+```
+
+**2. Simple 2-Level Priority (Some ARM Cortex-M0)**
+
+Cortex-M0 (the budget ARM core) has a stripped-down NVIC with **only 4 priority levels** (not 16 like M4):
+
+- **✓ Limited programmable priority:** You can set priorities, but only 0-3 (2 bits)
+- **✓ Nested interrupts supported:** But only 4 levels deep
+- **✗ Less flexibility:** With only 4 levels, managing 10+ peripherals becomes difficult
+
+**3. No Interrupt Controller (Cheap 8051, MSP430 Low-End)**
+
+Some ultra-cheap chips have **zero interrupt priority logic**—all interrupts are the same priority:
+
+- **First-come-first-served:** Whichever IRQ flag gets set first wins
+- **No nesting:** Once an ISR starts, ALL other interrupts are blocked until it finishes
+- **Software polling required:** The RTOS must manually poll flags to decide urgency
 
 #### Hardware Solution: The ARM NVIC (What the STM32F407 Does)
 
@@ -388,13 +434,18 @@ t=460ns:  Task_Net resumes its JSON formatting
 
 #### Summary: Why We Need NVIC for Deterministic Real-Time Control
 
-| Without NVIC (Cheap MCUs) | With NVIC (STM32F407) |
-| :--- | :--- |
-| Fixed interrupt priority (no flexibility) | Programmable 16-level priority per interrupt |
-| No preemption — ISRs run to completion | Hardware nested interrupts — critical ISR preempts lower-priority ISR mid-execution |
-| Software arbitration (slow, unpredictable) | Hardware arbitration (1 cycle, deterministic) |
-| CAN FIFO overflows if Modbus ISR is running | CAN ISR preempts Modbus ISR instantly, preventing overflow |
-| **Result: Unreliable, data loss** | **Result: Deterministic, guaranteed behavior** |
+**Direct Answer:** *"So NVIC allows to set priority for IRQ, but it is not available in non-NVIC controller, is it?"*
+
+**Correct!** Most non-NVIC controllers (8-bit AVR, PIC, basic ARM Cortex-M0) have **NO ability to set interrupt priority**—it's fixed in silicon by vector table position. The NVIC is what gives ARM Cortex-M3/M4/M7 their real-time capabilities.
+
+| Feature | Without NVIC (8-bit AVR, PIC, Cortex-M0) | With NVIC (STM32F407 Cortex-M4) |
+| :--- | :--- | :--- |
+| **Programmable priority?** | ❌ **NO** — Fixed by hardware vector table | ✅ **YES** — 16 programmable levels (0-15) |
+| **Runtime priority change?** | ❌ **NO** — Burned into silicon | ✅ **YES** — `HAL_NVIC_SetPriority()` |
+| **Nested interrupts?** | ❌ **NO** — ISR runs to completion | ✅ **YES** — High-priority preempts low mid-execution |
+| **Hardware preemption?** | ❌ **NO** — Software polls flags | ✅ **YES** — 1-cycle hardware comparator |
+| **Collision resolution** | Software (100s of cycles, jitter) | Hardware (1 cycle, deterministic) |
+| **Real-world result** | CAN FIFO overflow / data loss | CAN preempts Modbus instantly ✓ |
 
 **This is what "resolved mathematically by the silicon, not the RTOS" means:** The decision happens in hardware comparator circuits using binary priority numbers, not in software `if` statements subject to cache misses and unpredictable latency.
 
