@@ -76,7 +76,7 @@ The answer lies in **Deterministic Decoupling**.
 
 ---
 
-<a id="2"></a>
+<a id="sec-2"></a>
 ## 2. Load Balancing & Time-Based Control
 
 ### What We Are Achieving
@@ -216,7 +216,7 @@ So the RTOS controller is aligned to the same business goal, acting as the real-
 </div>
 
 
-<a id="3"></a>
+<a id="sec-3"></a>
 ## 3. Hardware Selection: Why the STM32F407?
 
 In a market saturated with microcontrollers, why did the team specifically select the STM32F407VGT6 for this Energy Management System?
@@ -700,7 +700,7 @@ In our architecture, we use J1939 **only for battery BMS communication**, becaus
 - **Termination:** 120Ω resistors at both ends of the bus
 - **Hardware filters:** We configure the STM32 bxCAN to accept only PGNs 65271, 65253, etc., and reject everything else to prevent FIFO overflow
 
-<a id="4"></a>
+<a id="sec-4"></a>
 ## 4. Estimated Hardware & Bill of Materials (BOM) Cost
 
 When designing an industrial-grade EMS controller for mass production, keeping hardware costs low while maintaining strict reliability is crucial. The strategic move from an Embedded Linux i.MX93 processor (which requires expensive DDR RAM, PMICs, and eMMC) down to a bare-metal RTOS on the STM32 brings a massive cost reduction.
@@ -736,7 +736,7 @@ This allows the entire firmware stack (including the custom `ims-rtos-mini` code
 
 ---
 
-<a id="5"></a>
+<a id="sec-5"></a>
 ## 5. Project Design & Team Methodology
 
 From a corporate team perspective, architecting a bare-metal RTOS from scratch requires extreme discipline. We built this step-by-step:
@@ -771,7 +771,7 @@ flowchart TD
 
 ---
 
-<a id="6"></a>
+<a id="sec-6"></a>
 ## 6. C Code to Silicon: The Build Flow & Linker Mapping
 
 To bridge the gap between high-level C logic and physical STM32 hardware execution, we rely on the GNU GCC toolchain. This is a multi-phase compilation process, meticulously mapped by the Linker Script.
@@ -1320,7 +1320,7 @@ sequenceDiagram
 
 ---
 
-<a id="7"></a>
+<a id="sec-7"></a>
 ## 7. The System Boot Flow & Timings
 
 When power is applied to the industrial **24V DC bus** from the battery racks, an onboard **DC-DC buck converter** steps the voltage down to a clean **3.3V rail** that feeds the STM32 and all 3.3V logic. The STM32 itself never sees 24V — it operates entirely on 3.3V. However, from a system perspective, the "power-on" event is the 24V bus energizing. The board does not instantly start running the FreeRTOS controller. It undergoes a rigid, multi-stage boot sequence designed for maximum industrial safety.
@@ -1840,7 +1840,7 @@ Beyond communication buses, the PCB uses several GPIO pins for visual feedback, 
 
 ---
 
-<a id="8"></a>
+<a id="sec-8"></a>
 ## 8. The OS API Layer: Why CMSIS-RTOS v2?
 
 We use the **CMSIS-RTOS v2 API (Version 2.1.3)** as our primary abstraction layer over the **FreeRTOS V10.3.1** kernel. If you inspect the codebase, you will notice we use commands like `osDelay()` and `osMessageQueuePut()` instead of FreeRTOS native commands like `vTaskDelay()` and `xQueueSend()`. This is because we wrap FreeRTOS inside **CMSIS-RTOS v2** (Cortex Microcontroller Software Interface Standard).
@@ -1858,7 +1858,7 @@ If you are upgrading from older STM32Cube firmware that used **v1**, here are th
 
 ---
 
-<a id="9"></a>
+<a id="sec-9"></a>
 ## 9. FreeRTOS Multitasking Topology
 
 In FreeRTOS, tasks spend the vast majority of their lives in the **Blocked State**, consuming 0% CPU cycles until an external event (Interrupt, Timer, or Queue Message) wakes them up. We use **Strict Priority-Based Preemptive Scheduling**.
@@ -1927,7 +1927,7 @@ osThreadNew(Start_Task_Poll, NULL, &pollTask_attributes);
 
 ---
 
-<a id="10"></a>
+<a id="sec-10"></a>
 ## 10. FreeRTOS Feature Checklist
 
 This section serves as a rapid-fire summary of the specific FreeRTOS API mechanics used in the project, explaining **what** they are, **why** they were chosen, and **how** they work.
@@ -1990,7 +1990,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
 
 ---
 
-<a id="11"></a>
+<a id="sec-11"></a>
 ## 11. Unused FreeRTOS Features
 
 While we utilized the core pillars of FreeRTOS, there are specific features we actively **chose not to use** to keep the architecture deterministic and memory-safe:
@@ -2002,7 +2002,7 @@ While we utilized the core pillars of FreeRTOS, there are specific features we a
 
 ---
 
-<a id="12"></a>
+<a id="sec-12"></a>
 ## 12. Inter-Task Communication (IPC)
 
 To prevent race conditions, tasks **never** access shared global variables directly. Instead, we use **FreeRTOS Message Queues** (`osMessageQueueNew`) to pass decoupled data structures by value.
@@ -2092,7 +2092,7 @@ If a writer tries to push data into a queue that has no remaining capacity, the 
 
 ---
 
-<a id="13"></a>
+<a id="sec-13"></a>
 ## 13. Deferred Interrupt Processing (ISRs)
 
 > 💡 * Key Concept:** The absolute golden rule of RTOS design is to keep Interrupt Service Routines (ISRs) incredibly short. ISRs should only move data into an RTOS object, unblock a task, and exit. All heavy processing is **deferred** to the task level.
@@ -2178,7 +2178,7 @@ A common question is: *"If DMA is so great for Modbus, why don't we use DMA for 
 
 ---
 
-<a id="14"></a>
+<a id="sec-14"></a>
 ## 14. Network Stack (WIZnet W5500 Hardware Offload)
 
 The STM32F407 does not run a bloated software TCP/IP stack (like LwIP) which would consume massive amounts of CPU and RAM. Instead, it delegates all heavy ethernet processing to the WIZnet W5500 silicon wrapper via SPI.
@@ -2201,7 +2201,7 @@ The W5500 has a physical Ethernet PHY status register (`PHYCFGR`). Inside the pr
 
 ---
 
-<a id="15"></a>
+<a id="sec-15"></a>
 ## 15. Over-The-Air (OTA) Updates & Memory Protection
 
 One of the most complex features of a bare-metal RTOS is updating its own executable code without "bricking" the board in the field.
@@ -3518,7 +3518,7 @@ We implemented an **"Image Confirmation"** fail-safe mechanism:
 
 ---
 
-<a id="16"></a>
+<a id="sec-16"></a>
 ## 16. System Timing & Frequencies Cheat Sheet
 
 For technical and architectural reviews, it is extremely common to be asked about the exact timing characteristics, hardware bus speeds, and RTOS configurations of your system. 
@@ -3630,7 +3630,7 @@ Setting `osDelay(300)` provides:
 
 ---
 
-<a id="17"></a>
+<a id="sec-17"></a>
 ## 17. Toolchain & Advanced Debugging Stack
 
 Developing bare-metal code with physical hardware interfaces requires professional embedded tooling. `printf()` debugging over a serial port is wildly insufficient.
@@ -3734,7 +3734,7 @@ In STM32CubeIDE: `Window → Show View → SWV → SWV ITM Data Console`. Set th
 
 ---
 
-<a id="18"></a>
+<a id="sec-18"></a>
 ## 18. Testing, Mocking & Static Analysis
 
 Industrial automation demands proof of reliability before physical deployment.
@@ -3789,7 +3789,7 @@ flowchart TD
 
 ---
 
-<a id="19"></a>
+<a id="sec-19"></a>
 ## 19. Efficiency, Optimizations & Memory Footprint
 
 ### What specific optimizations did we apply?
@@ -3823,7 +3823,7 @@ We selected this specific microcontroller because it provides massive headroom f
 
 ---
 
-<a id="20"></a>
+<a id="sec-20"></a>
 ## 20. System Reliability & Product Safety
 
 ### Industrial Grade Silicon (AEC-Q100)
