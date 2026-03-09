@@ -79,110 +79,136 @@ The answer lies in **Deterministic Decoupling**.
 <a id="2"></a>
 ## 2. Load Balancing & Time-Based Control
 
-### The i.MX93 (`ems-app`) vs. STM32 (`ems-mini-rtos`) Load Balancing Logic
+### What We Are Achieving
 
-The load balancing philosophies drastically differ between the flagship Embedded Linux CEMS and the RTOS mini edge-node counterpart.
+The RTOS controller is designed to do one job reliably in real time:
 
-#### `ems-app` (i.MX93) Strategy: Predictive & Scheduled
-The Linux-based architecture leverages its vast RAM (GBs) and persistent local database (Redis broker) to run a continuous, complex 2-second decision loop (`hems_control.cpp`).
-*   **Time Schedules (Timeslots):** The system relies heavily on `hems_timeslot_t` arrays defined by the user. These schedules command explicit Import, Export, and target Power Goals for specific times of the day.
-*   **Dynamic Phase Distribution:** It fluidly alternates among four modes (`IDLE`, `ECO_BALANCING`, `CHARGING`, `DISCHARGING`), precisely distributing power across 3 phases (Peak Shaving or Valley Filling) based on the instantaneous grid conditions combined with the current timeslot bounds.
-*   **Programmable Equations:** Uses `logic.cpp` to evaluate on-the-fly user-defined math equations to map system behavior dynamically without recompiling.
+1. Keep **grid import/export within configured limits**.
+2. Use battery/inverter commands to perform **peak shaving** (cut import peaks) and **valley filling** (charge when allowed).
+3. Guarantee **safety-first behavior**: if telemetry is invalid or a limit is hit, command a safe fallback.
 
-#### `ems-mini-rtos` (STM32) Strategy: Deterministic & Instantaneous
-The RTOS version completely lacks the storage/RAM to hold massive JSON databases of predictive timeslots and lacks a Python runtime to seamlessly manage UI scheduling data.
-*   **No Multi-Day Predictive Timeslots:** Complex schedules cannot be generated or stored locally out-of-the-box.
-*   **Instantaneous Control:** Decisions are made strictly based on raw physical telemetry pulled during `Task_Poll`. If the Grid Meter reads that import exceeds a hardcoded `MaxLimit`, `Task_Ctrl` instantly calculates the delta and commands the inverter to discharge.
-*   **Hardcoded Protection:** Safety overrides—like battery charging current limits scaling down during high temperatures—are statically compiled in C rather than dynamic logic evaluations.
+In simple terms: every control cycle, we read live power data, decide charge/discharge/idle, clamp by safety limits, then send one deterministic inverter command.
 
-**RTOS Instantaneous Control Loop Flow:**
+### How We Do It (Operational Model)
+
+The STM32 RTOS side is **instantaneous control**, not long-horizon optimization. It does not depend on heavy databases or cloud-side prediction.
+
+| Layer | Responsibility | Cycle Time |
+| :--- | :--- | :--- |
+| `Task_Poll` (High) | Read Modbus/CAN telemetry using DMA and package `SystemState_t` | ~300 ms loop |
+| `Task_Ctrl` (Medium) | Run balancing math + safety clamps + choose operation mode | Event-driven on queue data |
+| `Task_Net` (Low) | Publish telemetry + receive optional cloud override/schedule | Slower, non-critical |
+
+### Minimal Control Flow
+
 ```mermaid
-stateDiagram-v2
-    direction LR
-    
-    state "Task_Poll (High Priority)" as Task_Poll {
-        Rx_DMA --> Parse_Struct
-        Parse_Struct --> Push_Queue
-    }
-    
-    state "Task_Ctrl (Medium Priority)" as Task_Ctrl {
-        Pop_Queue --> Math_Clamp
-        Math_Clamp --> Check_Failsafes
-        Check_Failsafes --> Dispatch_Tx
-    }
-    
-    Grid_Meter --> Task_Poll : Modbus Telegram (RS-485)
-    Task_Poll --> Task_Ctrl : SystemState_t (0 Wait States via Queue)
-    Task_Ctrl --> Inverter : Modbus Command (Discharge / Charge)
+flowchart LR
+    A[Task_Poll: Read Grid/Battery/Inverter] --> B[Queue_Data: SystemState_t]
+    B --> C[Task_Ctrl: Compute target power]
+    C --> D{Safety checks pass?}
+    D -- Yes --> E[Send Modbus command to inverter]
+    D -- No --> F[Fallback: clamp to safe/idle command]
 ```
 
-### Is there Time-Based Control in the RTOS setup?
+### Operation Modes Used by `Task_Ctrl`
 
-Natively, out of the box, the FreeRTOS EMS project **lacks complex absolute time-of-day control (like Linux `cron`)** because microcontrollers do not have an inherently synced system clock upon boot. 
+| Mode | Trigger Condition (Typical) | Command Outcome |
+| :--- | :--- | :--- |
+| `DISCHARGE` | Grid import above configured upper limit and battery allows discharge | Reduce grid import |
+| `CHARGE` | Grid import below lower threshold / valley period and battery allows charge | Store energy in battery |
+| `IDLE/HOLD` | Grid already in band or constraints active | Keep command near zero/hold |
+| `FORCED_SAFE` | Invalid telemetry, comm timeout, SoC/temperature/protection violation | Force safe command |
 
-However, **it is entirely possible to add precise time-based control** to the RTOS project depending on the exact requirements. Here is how it can be implemented in detail:
+### What Checks Are Performed Before Sending Commands
 
-#### 1. Internal Hardware RTC (Real-Time Clock) & Backup Registers
-The STM32F407 silicon features a robust internal RTC peripheral that spans an isolated power domain. 
-*   **Implementation:** 
-    1.  Enable the RTC in STM32CubeIDE (`System Core > RTC`).
-    2.  Supply a 32.768 kHz quartz crystal to the `LSE` (Low-Speed External) oscillator pins (`PC14` and `PC15`). This provides absolute timing accuracy.
-    3.  Route a standard CR2032 coin-cell battery to the `VBAT` physical pin. Even if the main 3.3V system power fails, `VBAT` keeps the RTC ticking continuously.
+`Task_Ctrl` should only transmit inverter setpoints after these checks:
 
-*   **Controlling the RTC (Reading and Writing):**
-    Unlike standard variables, the RTC time is stored in protected hardware registers to prevent accidental corruption. To safely interact with the HAL API, you must always read or write **both Time and Date** sequentially.
+1. **Telemetry freshness check:** Reject stale queue data / communication timeout.
+2. **Power clamp check:** Clamp target setpoint to inverter and battery max charge/discharge limits.
+3. **Battery protection check:** Enforce SoC, voltage, temperature, and current boundaries.
+4. **Direction sanity check:** Never issue contradictory charge/discharge commands in same cycle.
+5. **Rate-of-change check:** Ramp limit setpoint changes to avoid electrical shocks and chatter.
+6. **Fail-safe check:** On any invalid state, send safe fallback (`IDLE` or conservative limit).
 
-    **Example: Writing the Time (Setting the Clock)**
-    ```c
-    RTC_TimeTypeDef sTime = {0};
-    RTC_DateTypeDef sDate = {0};
+### Where Time-Based Control Fits
 
-    // 1. Set Time (e.g. 14:30:00)
-    sTime.Hours = 14;
-    sTime.Minutes = 30;
-    sTime.Seconds = 0;
-    // Format is BIN explicitly (not BCD)
-    HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+Time-based logic is optional on RTOS and can be added in increasing complexity:
 
-    // 2. Set Date (Must be set together!)
-    sDate.Year = 24; // 2024
-    sDate.Month = RTC_MONTH_OCTOBER;
-    sDate.Date = 15;
-    HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
-    ```
+| Level | Mechanism | Best For |
+| :--- | :--- | :--- |
+| L1 | FreeRTOS software timers | Relative durations (e.g., charge for 2 hours) |
+| L2 | Internal STM32 RTC + `VBAT` | Local time-of-day windows (e.g., 02:00-05:00) |
+| L3 | NTP sync via `Task_Net` + lightweight schedule from cloud | Accurate tariff windows and remote schedule updates |
+| L4 | External RTC (DS3231) | High-accuracy deployments in harsh environments |
 
-    **Example: Reading the Time (Executing Logic)**
-    *Critical Note:* You **must** read `GetTime` followed immediately by `GetDate`. Reading the Time locks the hardware shadow registers so you get a consistent snapshot; reading the Date unlocks them.
-    ```c
-    RTC_TimeTypeDef currTime = {0};
-    RTC_DateTypeDef currDate = {0};
+### Quick "Achieve vs Execute" Summary
 
-    // Read Time FIRST, then Date to unlock hardware registers
-    HAL_RTC_GetTime(&hrtc, &currTime, RTC_FORMAT_BIN);
-    HAL_RTC_GetDate(&hrtc, &currDate, RTC_FORMAT_BIN); 
+| Question | RTOS Answer |
+| :--- | :--- |
+| What are we achieving? | Deterministic grid-limit control with safety-first battery dispatch |
+| How do we do it? | `Task_Poll` acquires data -> `Task_Ctrl` decides -> inverter command dispatch |
+| Type of operation? | Real-time closed-loop control (not long-horizon optimization) |
+| What checks gate commands? | Freshness, clamps, battery protection, ramp-rate, fail-safe fallback |
 
-    // Execute Time-Of-Use Load Balancing logic inside Task_Ctrl
-    if (currTime.Hours >= 2 && currTime.Hours < 5) {
-        set_inverter_mode(OP_MODE_FORCE_CHARGE); // Valley filling at 2AM
-    }
-    ```
+### Decision Logic (Policy View, Not Task Wiring)
 
-*   **Hardware Alarms & Battery-Backed SRAM:** 
-    Beyond timekeeping, the RTC peripheral block provides configuring `RTC Alarm A` hardware interrupts, allowing `Task_Ctrl` to sleep at 0% CPU and wake up *exactly* at a specific second. Additionally, this domain grants access to **20 Backup Registers** (80 bytes total). These 32-bit registers survive system reboots and power losses (powered by `VBAT`), making them the perfect place to safely store a "Crash Reason" before triggering a hardware watchdog reset.
+This is the actual control policy in plain decision terms.
 
-#### 2. FreeRTOS Software Timers (For Relative Delays)
-If the system does not care about the "Time of Day" (e.g., 2:00 PM) but only cares about "Duration" (e.g., "Charge for exactly 2 hours after a command is received"), we use the FreeRTOS Timer API.
-*   **Implementation:** Call `xTimerCreate()` and `xTimerStart()`. 
-*   **Logic:** The FreeRTOS Daemon Task (`tmrtask`) will run a callback exactly after the specified thousands of FreeRTOS ticks have elapsed. This is highly RAM efficient and requires no hardware RTC.
+1. Define a **system-level goal band** at the point of common coupling (grid meter):
+   `P_grid_min <= P_grid_total <= P_grid_max`.
+2. Compute error against that band using **aggregate power**, not per-device isolated values.
+3. Convert error into one net battery/inverter target `P_cmd`.
+4. Apply safety and hardware constraints.
+5. Dispatch final command.
 
-#### 3. Cloud Synchronization (NTP via W5500)
-If the STM32 has an active internet connection through the W5500 ethernet chip, time schedules can be kept incredibly accurate without a coin-cell battery.
-*   **Implementation:** Modify `Task_Net` to routinely execute a lightweight UDP socket request to an NTP pool (e.g., `pool.ntp.org`) via the W5500.
-*   **Logic:** Upon parsing the UNIX timestamp from the NTP server, `Task_Net` updates the STM32's internal RTC. 
-*   **Dynamic Schedules:** With NTP synced, the Cloud (via MQTT) can push a lightweight JSON array to the STM32 (e.g., `[{"start":1704067200,"mode":1}]`). `Task_Ctrl` stores this tiny array in SRAM and evaluates it continuously against the NTP-synced clock, effectively reproducing the `ems-app` timeslot behavior on a micro-scale.
+Policy equation:
 
-#### 4. External I2C RTC (e.g., DS3231)
-For the highest absolute safety in environments spanning extreme temperatures where the internal STM32 RTC might drift, an external temperature-compensated RTC (DS3231) is wired via I2C. `Task_Poll` reads this module every few seconds to guarantee hard compliance with utility grid Time-of-Use tariffs.
+```text
+If P_grid_total > P_grid_max:
+    P_cmd_raw = -(P_grid_total - P_grid_max)      # Discharge to shave import
+Else if P_grid_total < P_grid_min:
+    P_cmd_raw = +(P_grid_min - P_grid_total)      # Charge to absorb/export or valley-fill
+Else:
+    P_cmd_raw = 0                                 # Hold/idle in band
+
+P_cmd = Clamp(P_cmd_raw, -P_discharge_limit, +P_charge_limit)
+P_cmd = Apply_SOC_Temp_Current_Limits(P_cmd)
+P_cmd = Apply_RampRate(P_cmd, prev_cmd)
+If any invalid state: P_cmd = SAFE_FALLBACK
+```
+
+### System-Level Goal vs Device-Level Control
+
+Our target is **not** "optimize one inverter in isolation." The target is: all connected assets work together to meet one site-level objective.
+
+| Question | Control Policy Answer |
+| :--- | :--- |
+| What is optimized? | Site/grid boundary behavior (import/export envelope), not one device's local metric |
+| What are actuators? | Battery/inverter charge-discharge commands (possibly split by phase/device downstream) |
+| What is measured? | Aggregated telemetry: grid meter + inverter + battery constraints |
+| What is success? | Grid remains in target band while all protection constraints remain valid |
+
+### Are We Matching `cem-app` Goal Semantics?
+
+Yes, **goal class is the same**, but implementation depth differs:
+
+1. **Same objective class:** Keep site power within configured band using charge/discharge policy.
+2. **Same mode semantics:** `IDLE`, `CHARGING`, `DISCHARGING`, balancing behavior.
+3. **Same safety intent:** Clamp to constraints/limits before command dispatch.
+4. **Different sophistication:**
+   `cem-app` performs richer multi-phase scheduling and timeslot-aware policy orchestration.
+   `ems-mini-rtos` performs faster deterministic edge enforcement with a reduced state model.
+
+So the RTOS controller is aligned to the same business goal, acting as the real-time enforcement layer, while `cem-app` remains the policy-rich orchestrator.
+
+### Reference: Linux `ems-app` vs RTOS `ems-mini-rtos`
+
+| Aspect | Linux `ems-app` (i.MX93) | RTOS `ems-mini-rtos` (STM32) |
+| :--- | :--- | :--- |
+| Main style | Predictive + schedule-heavy | Deterministic + instantaneous |
+| Data model | Large state + Redis + dynamic equations | Lightweight structs + static limits |
+| Primary loop | Slower, feature-rich orchestration | Fast, safety-oriented control loop |
+| Best use | Planning, cloud workflows, multi-phase policy | Real-time enforcement on field hardware |
 
 ---
 <div align="center">
