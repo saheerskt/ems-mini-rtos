@@ -50,6 +50,21 @@ A common question internally and during code reviews is: *"Why introduce the com
 The answer lies in **Deterministic Decoupling**.
 
 1. **The Polling Jitter Problem:** In a bare-metal super-loop, the CPU must check every peripheral sequentially (e.g., `Read Grid Meter -> Read Battery -> Check MQTT -> Parse JSON`). If a network packet hangs and the TCP/IP stack takes 200ms to recover, or if building/parsing an MQTT payload blocks the CPU for 50ms, the entire loop freezes. This causes violent violations of strict timing protocols (e.g. Modbus 3.5 character idle frames) and causes immediate CAN bus mailbox starvation.
+
+   > **What is the Modbus 3.5 character idle frame?**
+   > Modbus RTU has no explicit "end of packet" byte in its protocol. Instead, the spec defines that a message is considered complete when the serial bus stays **silent for at least 3.5 character-times** after the last byte. At 9600 baud, one character takes ~1.04 ms, so 3.5 characters ≈ **~3.6 ms of bus silence**.
+   >
+   > The protocol uses this silence gap as its sole frame delimiter:
+   >
+   > | Gap duration | Meaning |
+   > | :--- | :--- |
+   > | < 1.5 char-times | Bytes belong to the same frame — still assembling |
+   > | 1.5 – 3.5 char-times | Malformed / illegal gap — discard entire frame |
+   > | **≥ 3.5 char-times** | **Frame complete — next byte starts a new message** |
+   >
+   > **Why a super-loop breaks this:** If the bare-metal loop is blocked for even 5 ms handling an MQTT payload, the 3.5-character silence window passes mid-receive. The Modbus slave sees the silence, interprets it as "master has finished," and immediately sends its reply. But the STM32's UART buffer is still occupied with the previous request. The reply bytes collide with the request bytes in the buffer, the CRC check fails, and the entire transaction is silently discarded. The inverter never receives its power command.
+   >
+   > **Why `Task_Poll` fixes this:** Because `Task_Poll` runs at `osPriorityRealtime` and owns the UART DMA exclusively, the 3.5-character timing window is always honoured — regardless of how long `Task_Net` takes to format its JSON payload.
 2. **Preemptive Prioritization:** FreeRTOS provides a "Preemptive Kernel". If the CPU is busy grinding through a lower-priority task like formatting a massive JSON payload from the Cloud (`Task_Net`), and a critical Modbus DMA timer expires (`Task_Poll`), FreeRTOS physically context-switches the CPU. It pauses the JSON parsing mid-instruction, hands 100% of the CPU to flush the physical Modbus queues, and then gracefully resumes the JSON parsing exactly where it left off. A bare-metal architecture cannot easily achieve this without unmaintainable "spaghetti" nested-interrupt state machines.
 3. **Power & Thermal Efficiency:** A bare-metal super-loop constantly consumes 100% of the CPU clock cycles polling via `if (flag_ready)`. With FreeRTOS, tasks that are waiting for timeouts or hardware DMA signals enter the `Blocked` state. This automatically forces the FreeRTOS Scheduler into the `Idle Task`, which executes the native ARM assembly instruction `WFI` (Wait For Interrupt). This physically halts the ALU clock tree, dropping CPU power consumption to near zero when the system is purely waiting on physical hardware, extending component lifespan and improving thermal constraints.
 
