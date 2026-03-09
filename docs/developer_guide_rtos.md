@@ -256,6 +256,148 @@ flowchart LR
 5. **Native Industrial Peripherals:** The chip has a built-in bxCAN controller (for direct J1939 battery communication) and 6 USARTs (for Modbus RS-485). Cheaper chips often lack CAN entirely, forcing an external MCP2515 SPI module that adds cost, PCB space, and failure points.
 6. **Industrial & Automotive Grade (AEC-Q100):** The STM32F407 family is available in **AEC-Q100 qualified** versions. This means the silicon has passed 10,000+ hours of rigorous stress testing (High Temperature Operating Life, Temperature Cycling) to guarantee reliability in harsh environments—critical for an EMS that must operate 24/7 for 10+ years in industrial electrical cabinets.
 
+### 🔧 Deep Dive: What is the NVIC and Why Does "Hardware Prioritization" Matter?
+
+**Common Engineering Question:** *"Point #2 mentions 'NVIC allows us to hardware-prioritize the CAN bus ISR over the Modbus DMA ISR, ensuring collisions are resolved mathematically by the silicon, not the RTOS.' What does this actually mean?"*
+
+#### What is the NVIC?
+
+The **Nested Vectored Interrupt Controller (NVIC)** is a **hardware block built directly into the ARM Cortex-M4 silicon**, completely separate from the FreeRTOS software scheduler. It manages all interrupt requests (IRQs) from peripherals like UART, CAN, DMA, Timers, etc.
+
+Think of it as a **hardware traffic controller** that decides which interrupt gets CPU time when multiple peripherals fire simultaneously.
+
+#### The Problem: Interrupt Collision (What Happens When Two Hardware Events Fire at the Same Nanosecond?)
+
+Imagine this real-world scenario in our EMS:
+
+1. **Modbus DMA** has just finished receiving a 256-byte grid meter response. The DMA controller fires an interrupt: `DMA1_Stream5_IRQn` to tell the CPU "I've got data ready!"
+2. **At the exact same nanosecond**, a critical CAN frame arrives from the Battery BMS (SOC update, temperature alarm). The CAN peripheral fires: `CAN1_RX0_IRQn`.
+
+**The question:** Which ISR (Interrupt Service Routine) gets to run first? If we pick wrong, the CAN FIFO could overflow (only 3 frames deep in silicon) and we'd lose a critical battery protection message.
+
+#### Software-Only Solution (What Cheap MCUs Do)
+
+On microcontrollers without an NVIC (or with primitive interrupt controllers), the silicon uses **fixed hardware vector tables** where interrupt priority is determined by the physical memory address of the ISR in the vector table. This is inflexible:
+
+- **Priority is fixed at compile time** — you can't dynamically adjust it.
+- **No preemption** — if the Modbus ISR is already running and the CAN interrupt fires, the CPU must wait until the entire Modbus handler finishes (could be 100+ microseconds) before servicing CAN. The CAN FIFO overflows and data is lost.
+- **Software arbitration required** — the RTOS must manually check flags and decide what to do, adding latency and jitter.
+
+#### Hardware Solution: The ARM NVIC (What the STM32F407 Does)
+
+The NVIC solves this **in pure hardware silicon** with these features:
+
+**1. Programmable Priority Levels (0-15 on STM32F4)**
+
+We can assign an exact numerical priority to every single interrupt source:
+
+```c
+// In our firmware initialization (main.c or stm32f4xx_it.c):
+
+// CAN Bus RX Interrupt — HIGHEST hardware priority (most critical)
+HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 4, 0);  // Preempt priority = 4
+
+// Modbus UART DMA RX Interrupt — LOWER hardware priority
+HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 5, 0);  // Preempt priority = 5
+```
+
+**Lower number = Higher priority.** So CAN (priority 4) beats Modbus DMA (priority 5).
+
+**2. Hardware Preemption (Nested Interrupts)**
+
+If the Modbus DMA ISR is currently running (servicing the 256-byte Modbus response), and a CAN interrupt fires, the NVIC **automatically**:
+
+1. **Saves the current Modbus ISR state** (registers R0-R3, R12, LR, PC, xPSR) onto the stack.
+2. **Pauses the Modbus ISR** mid-execution (could be in the middle of a `for` loop parsing bytes).
+3. **Immediately jumps to the CAN ISR** and gives it 100% CPU.
+4. When the CAN ISR finishes (`return`), the NVIC **automatically resumes the Modbus ISR** exactly where it left off.
+
+**All of this happens in hardware, in ~12-25 CPU cycles, with ZERO software intervention.**
+
+**3. Deterministic Timing ("Mathematically by the Silicon")**
+
+The phrase **"resolved mathematically by the silicon"** means:
+
+- The decision is made by **comparing two binary numbers** (priority 4 vs priority 5) in a hardware comparator circuit.
+- This comparison takes **exactly 1 clock cycle** (6 nanoseconds at 168 MHz).
+- There is **zero jitter, zero unpredictability**.
+- The outcome is **guaranteed by physics** — priority 4 will always preempt priority 5, regardless of what the RTOS software is doing.
+
+Contrast this with a software-based approach where the RTOS must:
+- Check interrupt flags in memory (`if (flagCAN || flagModbus)`)
+- Run comparison logic (branching, loops)
+- Adjust scheduling queues
+- Context-switch tasks
+
+This software path could take **hundreds or thousands of cycles** and varies based on cache state, compiler optimization, and RTOS load.
+
+#### Why This Matters for Our EMS
+
+Our system has time-critical requirements:
+
+| Peripheral | Time Sensitivity | What Happens If Delayed? |
+| :--- | :--- | :--- |
+| **CAN Bus (Battery BMS)** | **Ultra-critical** | CAN FIFO is only 3 frames deep. If we don't read within ~600µs (at 500kbps), frames are lost. A lost SOC update could cause the controller to over-discharge the battery, triggering BMS emergency shutdown. |
+| **Modbus DMA (Grid Meter)** | **Important but buffered** | DMA has a 256-byte buffer. The data is already in RAM. We can afford to delay parsing by 50-100µs without consequences. |
+| **MQTT/TCP (Task_Net)** | **Low priority** | Cloud communication can tolerate milliseconds of latency. |
+
+**The NVIC allows us to guarantee:** Even if a 256-byte Modbus frame just arrived and the CPU is parsing it, a critical CAN frame from the battery will preempt immediately, preventing data loss.
+
+#### Real-World Example: Interrupt Collision Resolution
+
+**Scenario:** At time `t = 0`:
+- CPU is running `Task_Net` (low priority FreeRTOS task, doing JSON formatting)
+- Modbus DMA finishes receiving grid meter data → `DMA1_Stream5_IRQn` fires (NVIC priority 5)
+- **5 nanoseconds later:** CAN frame arrives from BMS → `CAN1_RX0_IRQn` fires (NVIC priority 4)
+
+**Timeline (hardware-driven by NVIC):**
+
+```
+t=0ns:    Task_Net running (RTOS priority 24)
+t=10ns:   DMA interrupt fires → NVIC priority 5
+t=15ns:   NVIC hardware preempts Task_Net, saves context, jumps to DMA ISR
+t=20ns:   DMA ISR starts running (reading DMA status registers)
+t=25ns:   CAN interrupt fires → NVIC priority 4 (higher than 5!)
+t=30ns:   NVIC hardware PREEMPTS the DMA ISR mid-execution
+t=35ns:   NVIC saves DMA ISR context, jumps to CAN ISR
+t=40ns:   CAN ISR executes (reads CAN FIFO, puts frame in FreeRTOS queue)
+t=120ns:  CAN ISR finishes, returns
+t=125ns:  NVIC automatically restores DMA ISR context
+t=130ns:  DMA ISR resumes exactly where it was paused
+t=450ns:  DMA ISR finishes, returns
+t=455ns:  NVIC restores Task_Net context
+t=460ns:  Task_Net resumes its JSON formatting
+```
+
+**Key point:** The CAN ISR interrupted the DMA ISR, which had already interrupted Task_Net. This is **nested interrupts** — impossible without hardware NVIC.
+
+#### NVIC Priority vs FreeRTOS Task Priority (Critical Distinction)
+
+| | NVIC Interrupt Priority | FreeRTOS Task Priority |
+| :--- | :--- | :--- |
+| **Managed by** | Hardware silicon (NVIC controller) | Software (FreeRTOS kernel) |
+| **Controls** | Which ISR preempts which ISR | Which task gets CPU when no ISR is active |
+| **Speed** | ~1 clock cycle (6ns at 168MHz) | ~125 cycles (0.75µs) via PendSV context switch |
+| **Preemption** | Instant, mid-instruction | Only at RTOS scheduler ticks or blocking calls |
+| **Our CAN priority** | NVIC priority 4 (hardware) | N/A — ISRs don't have task priority |
+| **Our Task_Poll priority** | N/A — tasks don't have NVIC priority | `osPriorityRealtime` (FreeRTOS priority 48) |
+
+**Both layers work together:**
+1. **Hardware layer (NVIC):** Ensures CAN ISR beats Modbus DMA ISR when both fire simultaneously.
+2. **Software layer (FreeRTOS):** Ensures Task_Poll beats Task_Net when both are ready to run.
+
+#### Summary: Why We Need NVIC for Deterministic Real-Time Control
+
+| Without NVIC (Cheap MCUs) | With NVIC (STM32F407) |
+| :--- | :--- |
+| Fixed interrupt priority (no flexibility) | Programmable 16-level priority per interrupt |
+| No preemption — ISRs run to completion | Hardware nested interrupts — critical ISR preempts lower-priority ISR mid-execution |
+| Software arbitration (slow, unpredictable) | Hardware arbitration (1 cycle, deterministic) |
+| CAN FIFO overflows if Modbus ISR is running | CAN ISR preempts Modbus ISR instantly, preventing overflow |
+| **Result: Unreliable, data loss** | **Result: Deterministic, guaranteed behavior** |
+
+**This is what "resolved mathematically by the silicon, not the RTOS" means:** The decision happens in hardware comparator circuits using binary priority numbers, not in software `if` statements subject to cache misses and unpredictable latency.
+
 ### Why not a cheaper alternative?
 
 | Feature | **STM32F407** (Selected) | **STM32F103** (Cheaper) | **ESP32** (Popular) |
@@ -338,6 +480,174 @@ flowchart LR
 | **Ethernet** | `SPI1` (data bus only) | **W5500** (WIZnet) + RJ45 Jack with built-in magnetics | The W5500 is unique — it is not just a PHY. It contains a **full hardware TCP/IP stack** (MAC + PHY + IP + TCP + UDP) in silicon. The RJ45 jack includes galvanic isolation transformers to protect against ground loops. | ~$3.50 |
 
 > 💡 **Key Point:** The STM32's `bxCAN` peripheral handles the **CAN protocol** (arbitration, bit stuffing, CRC, error frames) entirely in hardware. The TJA1050 only handles the **electrical signaling**. Without the TJA1050, the STM32 knows *what* to say but physically cannot *speak* on the bus.
+
+### 🔌 The Relationship Between CAN and J1939
+
+**Common Engineering Question:** *"Earlier we mentioned 'bxCAN controller for direct J1939 battery communication.' What exactly is J1939, and how does it relate to CAN?"*
+
+This is a frequent point of confusion. **CAN and J1939 are NOT the same thing**—they operate at different layers of the communication stack.
+
+#### CAN: The Physical & Data Link Layer (OSI Layer 1 & 2)
+
+**CAN (Controller Area Network)** is a **low-level hardware protocol** developed by Bosch in the 1980s for automotive and industrial applications. It defines:
+
+- **Physical electrical signaling:** Differential CAN-H/CAN-L voltages, twisted-pair cabling, 120Ω termination resistors
+- **Bit timing & synchronization:** How to encode/decode bits at 125 kbps, 250 kbps, 500 kbps, or 1 Mbps
+- **Frame structure:** Standard 11-bit or Extended 29-bit identifiers, 0-8 bytes of data per frame
+- **Bus arbitration:** Non-destructive collision resolution (lower ID wins, higher ID backs off)
+- **Error detection:** 15-bit CRC, acknowledgment bits, error frames and retransmission
+
+**What CAN does NOT define:** It has **zero** understanding of what the data bytes actually mean. CAN doesn't know if byte 3 is "battery voltage" or "engine temperature"—it just moves raw bytes reliably.
+
+Think of CAN as the **postal service**: it guarantees your envelope arrives uncorrupted, but it has no idea if the letter inside is written in English, Spanish, or binary sensor data.
+
+#### J1939: The Application Layer Protocol (OSI Layer 7)
+
+**J1939** is a **high-level application protocol** developed by SAE (Society of Automotive Engineers) specifically for **heavy-duty vehicles** (trucks, buses, agricultural equipment, marine engines, **and industrial battery systems**).
+
+J1939 defines:
+
+- **Parameter Group Numbers (PGNs):** Standardized message IDs that map to specific data types
+  - Example: `PGN 65271` = "Vehicle Electrical Power #3" (battery voltage, current, temperature)
+  - Example: `PGN 65253` = "Engine Hours, Revolutions" 
+- **Suspect Parameter Numbers (SPNs):** The exact byte positions and scaling factors for each sensor reading
+  - Example: `SPN 168` = "Battery Potential/Power Input 1" (voltage in 0.05V per bit resolution, offset -1600V)
+- **Source addresses:** Device identification (Engine=0, Transmission=3, Battery=specific address range)
+- **Multi-packet transport:** How to break large messages (>8 bytes) into multiple CAN frames and reassemble them
+- **Diagnostic Trouble Codes (DTCs):** Standardized fault reporting
+
+**What J1939 does NOT define:** It has **zero** understanding of voltages, wire colors, or bit rates—it assumes CAN is already working underneath.
+
+Think of J1939 as the **language and grammar rules** for what to write inside the envelope. It says "battery voltage goes in bytes 3-4, scaled by 0.05V."
+
+#### The Stack Relationship (How They Work Together)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Application Layer (Our Firmware)                       │
+│  ─ bms_can.c: reads SPN 168 (battery voltage)          │
+│  ─ bms_can.c: reads SPN 158 (SOC percentage)           │
+│  ─ Parses J1939 PGN 65271 multi-byte structure         │
+└─────────────────────────────────────────────────────────┘
+                        ▲
+                        │ (J1939 defines WHAT the data means)
+                        ▼
+┌─────────────────────────────────────────────────────────┐
+│  J1939 Protocol Layer                                   │
+│  ─ PGN encoding/decoding                                │
+│  ─ 29-bit Extended CAN ID = Priority + PGN + Source    │
+│  ─ Multi-packet transport (BAM, CMDT)                  │
+│  ─ Address claiming                                     │
+└─────────────────────────────────────────────────────────┘
+                        ▲
+                        │ (Carried as payload inside CAN frames)
+                        ▼
+┌─────────────────────────────────────────────────────────┐
+│  CAN Protocol Layer (bxCAN hardware in STM32)          │
+│  ─ 29-bit identifier: 0x18FEF700 (example J1939 PGN)   │
+│  ─ Data Length Code (DLC): 8 bytes                     │
+│  ─ Data payload: [0x4B, 0x1E, 0xFF, 0x64, ...]        │
+│  ─ 15-bit CRC, ACK slot, error frames                  │
+└─────────────────────────────────────────────────────────┘
+                        ▲
+                        │ (CAN defines HOW bits are transmitted)
+                        ▼
+┌─────────────────────────────────────────────────────────┐
+│  Physical Layer (TJA1050 transceiver)                  │
+│  ─ Differential CAN-H/CAN-L voltages                   │
+│  ─ 500 kbps bit rate                                    │
+│  ─ Twisted-pair cable, 120Ω termination                │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### Real-World Example: Reading Battery State-of-Charge (SOC)
+
+**Without J1939 (Raw CAN — Would Require Reverse Engineering):**
+```
+CAN Frame received:
+  ID: 0x18FEF700 (what does this ID mean? no idea!)
+  Data: [0x4B, 0x1E, 0xFF, 0x64, 0x00, 0x00, 0xFF, 0xFF]
+  
+  Question: Which bytes are SOC? How do I convert to percentage?
+  Answer: You'd need the BMS manufacturer's proprietary manual, 
+          and the protocol could change with firmware updates.
+```
+
+**With J1939 (Standardized Protocol):**
+```
+J1939 PGN 65271 (0xFEF7) = "Vehicle Electrical Power #3"
+  Source Address: 0x00 (Battery BMS)
+  Priority: 6 (medium)
+  
+  SPN 158 (Battery State of Charge):
+    Location: Bytes 1-2
+    Data: 0x4B1E = 19230 decimal
+    Scaling: 0.4% per bit
+    Formula: SOC = 19230 × 0.4% = 76.92% ← Battery is at 77% charge!
+  
+  SPN 168 (Battery Voltage):
+    Location: Bytes 3-4
+    Data: 0xFF64 = 65380 decimal
+    Scaling: 0.05V per bit, offset -1600V
+    Formula: Voltage = (65380 × 0.05) - 1600 = 1669V ← High-voltage battery pack
+```
+
+**Code Implementation in Our Firmware:**
+```c
+// In bms_can.c — J1939 PGN 65271 decoder
+void decode_j1939_battery_power(uint8_t data[8]) {
+    // Extract SPN 158 (SOC) from bytes 1-2 (big-endian)
+    uint16_t soc_raw = (data[1] << 8) | data[2];
+    float soc_percent = soc_raw * 0.4;  // J1939 scaling factor
+    
+    // Extract SPN 168 (Voltage) from bytes 3-4
+    uint16_t voltage_raw = (data[3] << 8) | data[4];
+    float voltage_V = (voltage_raw * 0.05) - 1600.0;  // J1939 offset
+    
+    // Now we have standardized battery data!
+    BatteryState_t bms_state = {
+        .soc_percentage = soc_percent,
+        .voltage_V = voltage_V,
+        // ... etc
+    };
+}
+```
+
+#### Why Do We Use J1939 for Battery Communication?
+
+| Reason | Benefit for EMS |
+| :--- | :--- |
+| **Industry standard** | Battery BMS vendors (LG Chem, CATL, BYD, Pylontech) already implement J1939 natively—no custom protocol development needed |
+| **Interoperability** | We can swap battery brands without rewriting firmware (as long as they follow J1939 spec) |
+| **Rich diagnostics** | J1939 includes built-in fault codes (DTCs), allowing us to detect "cell imbalance," "over-temperature," "contactor failure" via standardized error messages |
+| **Multi-packet support** | J1939 handles messages >8 bytes automatically (e.g., reading all 16 cell voltages requires 32+ bytes, split across multiple CAN frames) |
+| **Proven reliability** | J1939 has been battle-tested in heavy-duty trucks for 30+ years in extreme environments (vibration, EMI, temperature) |
+
+#### Summary Table: CAN vs J1939
+
+| Aspect | CAN (Controller Area Network) | J1939 (SAE Standard) |
+| :--- | :--- | :--- |
+| **Layer** | Physical + Data Link (OSI Layer 1-2) | Application (OSI Layer 7) |
+| **What it defines** | Voltages, bit rates, frame structure, arbitration | Data meaning, scaling, PGNs, SPNs, units |
+| **Analogy** | The postal service (delivers envelopes reliably) | The language inside the letter (English grammar, vocabulary) |
+| **Example output** | "I received 8 bytes: [0x4B, 0x1E, ...]" | "Battery SOC = 77%, Voltage = 1669V" |
+| **Implemented by** | STM32 bxCAN hardware + TJA1050 transceiver | Software in our firmware (`bms_can.c` decoder) |
+| **Used in** | Automotive, industrial machinery, robotics | Heavy-duty vehicles, marine engines, **battery systems** |
+| **Flexibility** | Generic—works for any application | Specific—optimized for vehicle/energy systems |
+
+#### Where J1939 is Used in Our EMS
+
+In our architecture, we use J1939 **only for battery BMS communication**, because:
+
+1. Industrial battery packs (especially high-voltage lithium-ion) come with BMS controllers that broadcast J1939 natively
+2. Grid meters and inverters use **Modbus RTU** instead (older, more universal protocol for power electronics)
+3. The STM32's bxCAN hardware makes receiving/parsing J1939 trivial (no external protocol chip needed)
+
+**Our CAN configuration for J1939:**
+- **Bit rate:** 500 kbps (J1939 heavy-duty standard)
+- **ID type:** Extended 29-bit CAN IDs (required by J1939)
+- **Termination:** 120Ω resistors at both ends of the bus
+- **Hardware filters:** We configure the STM32 bxCAN to accept only PGNs 65271, 65253, etc., and reject everything else to prevent FIFO overflow
 
 <a id="4"></a>
 ## 4. Estimated Hardware & Bill of Materials (BOM) Cost
