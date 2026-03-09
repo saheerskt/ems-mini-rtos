@@ -1,4 +1,4 @@
-# Interview Practice — Questions & Answers
+# Technical Reference — Questions & Answers
 
 > 💡 **How to use this sheet:** Section A contains all practice questions. Section B contains the model answers. Try to answer each question from memory first, then cross-reference Section B.
 
@@ -165,7 +165,7 @@
 
 ---
 
-> 🎯 **Interview Tip:** The most commonly probed areas for Senior Firmware / Embedded Systems roles are:
+> 🎯 **Study Tip:** The most commonly probed areas for Senior Firmware / Embedded Systems roles are:
 > Priority Inversion, DMA vs Interrupt tradeoffs, Queue overflow behaviour, OTA partition swap safety, VTOR shifting, and the `vTaskSuspendAll()` Flash erase race condition.
 
 ---

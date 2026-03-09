@@ -259,7 +259,7 @@ When initially creating the New STM32 Project:
 * **RCC**: 
     * `High Speed Clock (HSE)`: **Crystal/Ceramic Resonator** (assuming an external crystal, typically 8MHz or 25MHz, is present on the board).
 
-### 9.2 Clock Tree Architecture (Interview / Deep Dive)
+### 9.2 Clock Tree Architecture (Technical Deep Dive)
 Understanding the STM32 Clock Tree is critical for hardware engineers and embedded firmware developers. The microcontrollers contain multiple internal buses that run at different maximum speeds.
 
 #### Definitions:

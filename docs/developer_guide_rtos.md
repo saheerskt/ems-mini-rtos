@@ -240,7 +240,7 @@ From a software perspective, the Cortex-M4 is an "Upgraded M3" with two critical
 
 ### External Transceiver Chips (Why the STM32 can't drive the bus directly)
 
-A very common interview question is: *"Can the STM32 talk directly to a CAN bus or RS-485 wire?"* The answer is **No.**
+A common engineering question is: *"Can the STM32 talk directly to a CAN bus or RS-485 wire?"* The answer is **No.**
 
 The STM32F407's internal peripherals (bxCAN, USART, SPI) output standard **3.3V CMOS logic levels** (0V = LOW, 3.3V = HIGH) on their GPIO pins. Industrial buses use completely different electrical signaling:
 
@@ -296,7 +296,7 @@ flowchart LR
 | **RS-485 Modbus** | `USART2` (built-in UART) | **MAX3485** (Maxim) | Converts 3.3V UART TX/RX to differential RS-485 A/B. The `DE` pin controls half-duplex direction (transmit vs receive). | ~$0.60 |
 | **Ethernet** | `SPI1` (data bus only) | **W5500** (WIZnet) + RJ45 Jack with built-in magnetics | The W5500 is unique — it is not just a PHY. It contains a **full hardware TCP/IP stack** (MAC + PHY + IP + TCP + UDP) in silicon. The RJ45 jack includes galvanic isolation transformers to protect against ground loops. | ~$3.50 |
 
-> 💡 **Interview Key Point:** The STM32's `bxCAN` peripheral handles the **CAN protocol** (arbitration, bit stuffing, CRC, error frames) entirely in hardware. The TJA1050 only handles the **electrical signaling**. Without the TJA1050, the STM32 knows *what* to say but physically cannot *speak* on the bus.
+> 💡 **Key Point:** The STM32's `bxCAN` peripheral handles the **CAN protocol** (arbitration, bit stuffing, CRC, error frames) entirely in hardware. The TJA1050 only handles the **electrical signaling**. Without the TJA1050, the STM32 knows *what* to say but physically cannot *speak* on the bus.
 
 <a id="4"></a>
 ## 4. Estimated Hardware & Bill of Materials (BOM) Cost
@@ -864,7 +864,7 @@ When the CPU receives interrupt #15 (SysTick), it reads address `SCB->VTOR + 0x0
 
 #### How Task Switching Actually Works (The Full Flow)
 
-This is one of the most commonly asked interview questions. Here is the **exact sequence** of what happens inside the ARM Cortex-M4 and FreeRTOS kernel when a context switch occurs:
+This is one of the most commonly asked engineering questions. Here is the **exact sequence** of what happens inside the ARM Cortex-M4 and FreeRTOS kernel when a context switch occurs:
 
 ```mermaid
 sequenceDiagram
@@ -914,7 +914,7 @@ sequenceDiagram
 
 **Total context switch time: ~125 CPU cycles ≈ 0.75 microseconds at 168 MHz.**
 
-> 💡 **Key Interview Point:** The context switch uses **two ISRs** — `SysTick` (high priority, just makes the decision) and `PendSV` (lowest priority, does the actual register swap). The reason for this split is that if a CAN or UART ISR fires at the same time as SysTick, the higher-priority hardware ISR runs first. PendSV patiently waits and only performs the switch when the CPU is completely idle from all hardware servicing.
+> 💡 **Key Point:** The context switch uses **two ISRs** — `SysTick` (high priority, just makes the decision) and `PendSV` (lowest priority, does the actual register swap). The reason for this split is that if a CAN or UART ISR fires at the same time as SysTick, the higher-priority hardware ISR runs first. PendSV patiently waits and only performs the switch when the CPU is completely idle from all hardware servicing.
 
 ---
 
@@ -1026,7 +1026,7 @@ To understand this boot flow, it helps to compare it directly against the Embedd
 
 ### ⏰ Clock Tree & PLL Configuration (Deep Dive)
 
-This is a **top-tier interview topic**. Every STM32 project must configure its clock tree, and getting it wrong means all peripherals (UART, SPI, CAN, timers) run at wrong speeds and silently produce garbage data.
+This is a **critical engineering topic**. Every STM32 project must configure its clock tree, and getting it wrong means all peripherals (UART, SPI, CAN, timers) run at wrong speeds and silently produce garbage data.
 
 #### The Clock Path (How 8 MHz Becomes 168 MHz)
 
@@ -1102,7 +1102,7 @@ void SystemClock_Config(void) {
 }
 ```
 
-#### 🎯 Interview-Level Clock Tree Notes
+#### 🎯 Clock Tree Deep-Dive Notes
 
 | Question | Answer |
 | :--- | :--- |
@@ -1118,7 +1118,7 @@ void SystemClock_Config(void) {
 
 ### 📏 How To Measure Boot Timing Per Phase
 
-To **prove** these boot timing numbers (critical for certification and interviews), we use two methods:
+To **prove** these boot timing numbers (critical for certification and technical reviews), we use two methods:
 
 **Method 1: GPIO Toggle + Logic Analyzer (Most Accurate)**
 We add a single `HAL_GPIO_TogglePin()` call at the entry point of each boot phase. By probing these pins with a Saleae Logic Analyzer, we get **nanosecond-accurate** timestamps for each phase transition:
@@ -1322,7 +1322,7 @@ graph TD
 
 ### Physical Wiring: CAN Bus & RS-485 Connections
 
-A common interview question is: *"How many wires does CAN bus actually need? What about RS-485?"* Here is the exact physical wiring used in our project:
+A common engineering question is: *"How many wires does CAN bus actually need? What about RS-485?"* Here is the exact physical wiring used in our project:
 
 #### CAN Bus Wiring (To BMS Battery Rack)
 
@@ -3119,7 +3119,7 @@ We implemented an **"Image Confirmation"** fail-safe mechanism:
 <a id="16"></a>
 ## 16. System Timing & Frequencies Cheat Sheet
 
-For technical interviews and architectural reviews, it is extremely common to be asked about the exact timing characteristics, hardware bus speeds, and RTOS configurations of your system. 
+For technical and architectural reviews, it is extremely common to be asked about the exact timing characteristics, hardware bus speeds, and RTOS configurations of your system. 
 
 Here is the master lookup table detailing the exact clock frequencies, speeds, and task durations configured for `ems-mini-rtos`:
 

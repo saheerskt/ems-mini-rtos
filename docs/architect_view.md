@@ -1,6 +1,6 @@
 # Architect's View: Design Decisions & Rationale
 
-When an interviewer asks "How did you do it?" or "How can you say you *architected* this?", they aren't looking for a list of C functions. They want to see **Design Intent**, **Trade-offs**, and **Systems Thinking**.
+When a technical reviewer asks "How did you do it?" or "How can you say you *architected* this?", they aren't looking for a list of C functions. They want to see **Design Intent**, **Trade-offs**, and **Systems Thinking**.
 
 ## 1. The "How did you do it?" Roadmap (The 5 Steps)
 
@@ -72,7 +72,7 @@ No. Standard Linux (even with `pthreads`) is **Fair-Share**, while an RTOS is **
 
 ## 4. The "Natural" Response Script
 
-**Interviewer:** *"I see you architected a deterministic RTOS controller. How did you approach that and why do you consider yourself the architect?"*
+**Technical Question:** *"I see you architected a deterministic RTOS controller. How did you approach that and why do you consider yourself the architect?"*
 
 **Your Response:**
 > "I approached it by first identifying that our previous super-loop design had too much jitter for industrial power balancing. I architected the migration to a **multi-task RTOS** by designing a prioritized thread topology. I made the call to use **DMA-based I/O offloading** to keep the CPU free for the control algorithms, and I established the **Zero-Malloc and Queue-based IPC templates** that the rest of the team followed. My role wasn't just writing drivers; it was defining the hardware-software contract, selecting the memory-protection strategies (like CCM RAM usage), and designing the A/B fail-safe OTA update logic."
