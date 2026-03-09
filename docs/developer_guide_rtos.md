@@ -3187,6 +3187,86 @@ Here is the master lookup table detailing the exact clock frequencies, speeds, a
 | **`Task_Net` Cycle (MQTT)** | `5000 ms` | We only publish to the AWS IoT Cloud every 5 seconds. This saves massive cellular/data costs while retaining "real-time" dashboard feels. |
 | **IWDG (Watchdog Timer)** | `~2.5 to 3.0 sec` | An independent, analog silicon timer. If the FreeRTOS engine crashes (Hard Fault) and fails to reset this timer within 3 seconds, the hardware forcibly physically reboots the board. |
 
+#### 🧮 How We Derived the 300ms `Task_Poll` Cycle Time
+
+**Common Engineering Question:** *"Why exactly 300 milliseconds? Why not 100ms for tighter control, or 1000ms to reduce CPU load?"*
+
+The 300ms polling period is **not arbitrary**. It was calculated from the **physical hardware constraints** of Modbus RTU communication, **multi-device sequential polling**, and **control bandwidth requirements**:
+
+##### Step 1: Modbus RTU Physical Transmission Time
+
+At **9600 baud** (1 bit per ~104 µs):
+- A typical Modbus request frame: **8 bytes** (Slave ID, Function Code, Register Address, CRC)
+  - Transmission time: `8 bytes × 10 bits/byte ÷ 9600 baud ≈ 8.3 ms`
+- A typical Modbus response frame: **50-60 bytes** (depends on register count)
+  - Transmission time: `60 bytes × 10 bits/byte ÷ 9600 baud ≈ 62.5 ms`
+- **Modbus mandatory 3.5-character silence gap:** `3.5 × (10 bits ÷ 9600) ≈ 3.6 ms` (both before and after each frame)
+
+**Total for one complete request-response transaction:**
+```
+TX time + silence + RX time + silence + slave processing delay
+= 8.3ms + 3.6ms + 62.5ms + 3.6ms + ~20-80ms (slave internal processing)
+≈ 100-160ms per device
+```
+
+##### Step 2: Multiple Sequential Device Polling
+
+`Task_Poll` communicates with:
+1. **Grid Meter** (Modbus Slave ID 1) — Grid power, voltage, frequency
+2. **Inverter** (Modbus Slave ID 2, or multiple inverters if stacked) — Inverter status, power output
+
+If polling **2 devices sequentially**:
+```
+Total sequential polling time = 100-160ms × 2 devices = 200-320ms
+```
+
+If a device occasionally takes longer (noisy electrical environments can cause retries):
+```
+Worst-case with one retry = ~250-350ms
+```
+
+##### Step 3: Control Bandwidth & Nyquist Sampling
+
+For **grid balancing applications**, we're controlling systems where:
+- **Electrical transients** (grid power fluctuations, solar cloud shadows, loads switching on/off) happen on **second-scale timescales** (1-10 seconds typical)
+- **Battery inverter ramp rates** are limited to ~500W/second to prevent inrush damage
+- **Grid import/export changes** propagate through the DNO (Distribution Network Operator) transformer with ~1-2 second latency
+
+**Nyquist theorem** states: *To accurately track a signal, sample at **at least 2× the highest frequency component**.*
+
+If grid fluctuations have a typical bandwidth of **0.5-1 Hz** (one change every 1-2 seconds), we need:
+```
+Minimum sampling rate = 2 × 1 Hz = 2 Hz
+→ Maximum sampling period = 500ms
+```
+
+Sampling at **300ms = 3.33 Hz** provides:
+- **1.67× safety margin** above Nyquist minimum
+- Sufficient resolution to detect grid changes before they propagate into violations
+- Fast enough to implement **closed-loop peak shaving** without oscillation
+
+##### Step 4: Safety Margins & Queue Depth
+
+Setting `osDelay(300)` provides:
+- **Headroom for Modbus timeouts:** If one device fails (wire cut, slave offline), the 250ms Modbus timeout + next poll still fits within ~300ms cadence without queue saturation
+- **Prevents queue overflow:** `Queue_Data` has 32-element capacity. Even if `Task_Ctrl` stalls briefly, `Task_Poll` can enqueue 32 samples before dropping data. At 300ms/sample, this gives 9.6 seconds of buffering.
+- **Deterministic scheduling:** 300ms is evenly divisible by FreeRTOS SysTick (1ms), avoiding floating-point timing drift
+
+##### Summary: The 300ms Timing Budget
+
+| Factor | Contribution to 300ms | Rationale |
+| :--- | :--- | :--- |
+| **Modbus RTU physics** | ~100-160ms per device | 9600 baud transmission + 3.5-char gaps + slave processing |
+| **Sequential multi-device polling** | ×2 devices = 200-320ms | Grid meter + Inverter(s) polled one after another |
+| **Control bandwidth requirement** | Need <500ms (Nyquist for 1Hz signals) | Grid fluctuations are slow (1-10 second timescales) |
+| **Safety margin** | 300ms chosen | Allows retry tolerance + prevents queue saturation + matches 1ms SysTick |
+
+**Result:** `osDelay(300)` provides a **deterministic, hardware-constrained, control-theory-validated polling period** that balances **real-time responsiveness** with **physical communication limits**.
+
+> **Alternative Design (Why NOT 100ms or 1000ms):**
+> - **100ms:** Would require reducing Modbus frame sizes or increasing baud rate to 19200+, risking EMI issues over long RS-485 cables in industrial environments. Also unnecessary — grid dynamics don't change that fast.
+> - **1000ms:** Would violate Nyquist theorem for 1Hz grid fluctuations, causing aliasing where we miss rapid load changes, leading to poor peak-shaving performance.
+
 ---
 
 <a id="17"></a>
