@@ -1148,13 +1148,18 @@ diff <(xxd build/stm32f4/mcuboot.bin) <(xxd verify_dump.bin) && echo "Flash veri
 | `mcuboot.bin` | Flashed to `0x08000000` once | Bootloader image permanently on device |
 | `ems_rtos_signed.bin` | Flashed to `0x08040000` | Signed application image |
 
-> ⚠️ **Key rotation:** If the private key is ever compromised or a new product variant is created, repeat Steps 3–8. The new `mcuboot.bin` (with the new public key) must be re-flashed to every board, and all future app binaries must be re-signed with the new private key. Old signed binaries signed with the old key will be **rejected** by the updated bootloader.
+> ⚠️ **Key rotation and MCUboot update boundary:** If the private key is ever compromised or a new product variant is created, the new `mcuboot.bin` (with new public key) must be re-flashed and future app binaries re-signed.
+>
+> This is possible only while boards are still in development/unlocked state (for example, before permanent `RDP Level 2` + boot-sector `WRP` lock).
+>
+> After production lock is applied, MCUboot and its embedded public key are intentionally non-updatable on-device. Old binaries signed by the old key are rejected by the updated bootloader, and updated bootloader rollout requires unlocked manufacturing path (or chip replacement on fully locked units).
 
 #### Stage 2: The Main EMS Application (Our Project)
 *   **Where is it?** This is the project you see in your current CubeIDE window.
 *   **Build Method**: Standard Build in CubeIDE.
 *   **The Output**: This generates `ems_rtos.bin`.
-*   **⚠️ CRITICAL**: You **cannot** flash this `ems_rtos.bin` directly to the chip yet! Why? Because it lacks the "Signed Header" that MCUboot expects. If you flash this raw file to `0x08040000`, MCUboot will look at it, see no signature, and refuse to boot.
+*   **⚠️ CRITICAL**: You **must not use** raw `ems_rtos.bin` as the MCUboot app image. It lacks the signed MCUboot header/TLV.
+*   **Important distinction:** the **flash/program command itself may still succeed** (bytes can be written at `0x08040000`), but at next reset MCUboot authentication fails and it refuses to boot that image.
 
 #### Stage 3: The Signing Step (`imgtool`)
 This is the "Secret Sauce" that bridges the two projects. After you build your app in CubeIDE, you must run a Python tool called **`imgtool`**:
@@ -1183,8 +1188,10 @@ imgtool sign --key root-ec-p256.pem \
 5.  **FreeRTOS** starts running.
 
 ### What changes did we do in our App to support this?
-1.  **Linker Script**: We changed `ORIGIN = 0x08000000` to `ORIGIN = 0x08040400`. We left a **0x400 (1024 byte) hole** at the start of the memory map to make room for the MCUboot Image Header.
-2.  **Vector Table Offset**: We updated the `VTOR` register in `system_stm32f4xx.c` so the CPU knows the interrupt table has moved from the default position to the new app start address.
+1.  **Linker Script (current repo state):** `STM32F407VGTX_FLASH.ld` sets `FLASH ORIGIN = 0x08040000` with `LENGTH = 384K` for the application slot.
+2.  **Vector Table Offset (current repo state):** `Core/Src/system_stm32f4xx.c` enables `USER_VECT_TAB_ADDRESS` and sets `VECT_TAB_OFFSET = 0x00040000U`, so `SystemInit()` programs `SCB->VTOR = FLASH_BASE | VECT_TAB_OFFSET = 0x08040000`.
+
+> Note: `0x08040400` is the address you would use when the application is linked to start *after* a 0x400-byte MCUboot header in the same slot. That is a valid layout, but it is **not** what this repository currently configures.
 **Our Modified Linker Script (`STM32F407VGTX_FLASH.ld`):**
 ```text
 MEMORY
@@ -1208,16 +1215,16 @@ The very first 4 bytes at the beginning of any ARM Cortex-M binary is the Initia
 **The Problem:**
 After MCUboot finishes verification and jumps to `0x08040000`, the ARM core's VTOR register still points to `0x08000000` (the bootloader's vector table). So when the FreeRTOS `SysTick` timer fires 1ms later, the CPU looks up the SysTick handler at address `0x08000000 + offset`, which is a **bootloader function** — not our FreeRTOS handler. The CPU jumps to random MCUboot code, and instantly crashes into a **Hard Fault**.
 
-**The Fix — Exact Code Change in `system_stm32f4xx.c`:**
+**The Fix — Actual `system_stm32f4xx.c` configuration in this repo:**
 ```c
 // ──── File: Core/Src/system_stm32f4xx.c ────
 
-// Step 1: Enable the custom VTOR address (uncomment this #define)
-#define USER_VECT_TAB_ADDRESS    // ← This was commented out by default!
+// Step 1: Enable custom VTOR relocation
+#define USER_VECT_TAB_ADDRESS
 
-// Step 2: Set the offset to match our linker script origin
+// Step 2: Offset matches linker FLASH origin (0x08040000)
 #ifdef USER_VECT_TAB_ADDRESS
-  #define VECT_TAB_OFFSET  0x00040000U   // ← Changed from 0x00000000 to 0x00040000
+    #define VECT_TAB_OFFSET  0x00040000U
 #endif                                   //    This is 256KB = the gap for MCUboot
 
 // Step 3: SystemInit() applies the shift at boot (called before main())
@@ -1231,12 +1238,9 @@ void SystemInit(void)
   /* Vector Table Relocation ─────────────────────────── */
   #ifdef USER_VECT_TAB_ADDRESS
     SCB->VTOR = FLASH_BASE | VECT_TAB_OFFSET;
-    // ↑ This single line is the magic.
-    // FLASH_BASE = 0x08000000 (defined by CMSIS)
-    // VECT_TAB_OFFSET = 0x00040000 (our #define above)
-    // Result: SCB->VTOR = 0x08040000
-    // Now when SysTick fires, the CPU looks at 0x08040000 + SysTick_offset
-    // which is OUR FreeRTOS handler, not the bootloader's!
+        // FLASH_BASE = 0x08000000
+        // VECT_TAB_OFFSET = 0x00040000
+        // Result: VTOR = 0x08040000
   #endif
 }
 ```
