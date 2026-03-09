@@ -3195,6 +3195,42 @@ sequenceDiagram
    * **This is the essence of Secure Boot:** If a single bit in Bank 2 was corrupted during download, or if a hacker injected malicious code without possessing our offline Private Key, the mathematical validation instantly fails.
 9. **Final Decimation:** If the cryptography succeeds, MCUboot confidently obliterates Bank 1, copies the pristine Bank 2 software over, and jumps the PC (Program Counter) to the new application entry point. If verification **fails**, MCUboot rejects the image instantly, scrubs Bank 2, and blindly boots the old safe Bank 1 firmware, preventing a bricked or compromised gateway!
 
+### 14.3.1 Why We Moved to MCUboot (Industrial Safety + Commercial Security)
+
+We adopted MCUboot to satisfy both functional safety expectations (IEC 62061-aligned behavior) and commercial cybersecurity requirements:
+
+1. **Image Authentication:** A raw STM32 project without a secure bootloader will execute whatever image is flashed. MCUboot blocks this by validating a cryptographic signature before handoff.
+2. **Resilient OTA / Rollback:** If power loss or software failure occurs during or after update, MCUboot can recover to the last known-good image instead of bricking.
+3. **Deterministic Boot Decision:** Boot acceptance/rejection is made in bootloader state logic before FreeRTOS tasks start, reducing unsafe startup ambiguity.
+
+#### How MCUboot "Swap Back" Is Actually Managed
+
+Unlike Embedded Linux systems that often use U-Boot environment variables (`boot_part`, `bootcount`, `upgrade_available`) to select rootfs A/B, MCUboot stores boot state in **image trailer metadata** in flash (per slot).
+
+Typical MCUboot state fields include:
+- `magic`: Marks a slot as containing a pending upgrade image.
+- `copy_done`: Indicates swap/copy operation reached completion.
+- `image_ok`: Confirms new image is accepted permanently by the application.
+- `swap_type`: Derived boot action (`test`, `permanent`, `revert`, or `none`).
+
+#### Practical Flow (MCUboot Test + Confirm + Revert)
+
+1. OTA writes signed image to secondary slot and sets trailer markers (`magic`, pending test/permanent intent).
+2. On reset, MCUboot verifies signature and begins swap/copy into primary execution slot.
+3. New firmware boots in **test mode** unless permanently confirmed.
+4. Application performs health checks (startup self-test, comms sanity, watchdog stability).
+5. If healthy, app calls confirm API (`boot_set_confirmed()`), setting `image_ok`.
+6. If app crashes/resets before confirmation, next boot sees unconfirmed test image and MCUboot performs **automatic revert** to previous confirmed image.
+
+#### Why This Differs from Embedded Linux Boot Env Selection
+
+- **Linux A/B pattern:** Bootloader chooses `rootfsA` or `rootfsB` using mutable env strings/counters.
+- **MCUboot pattern:** Bootloader uses immutable code + flash trailer state machine; no shell env script is required.
+- **Linux rollback trigger:** Usually bootcount threshold or user-space health service.
+- **MCUboot rollback trigger:** Missing image confirmation (`image_ok`) after test boot.
+
+This is why MCUboot is preferred on microcontrollers for safety-critical OTA: it provides a compact, deterministic, cryptographically enforced update state machine without relying on Linux-style runtime environment variables.
+
 ### 14.4 Secure Boot Key Provisioning: Where Does the Key Live & Can It Be Changed?
 
 This is the most commonly missed aspect of Secure Boot in embedded systems. The ECDSA P-256 Key Pair has two halves with completely different storage and lifecycle requirements.
