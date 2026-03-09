@@ -74,6 +74,17 @@ The answer lies in **Deterministic Decoupling**.
 *   **Industrial Bridges:** Modbus RTU (USARTs with DMA) & Battery BMS (Hardware CAN)
 *   **Networking:** WIZnet W5500 via SPI (Offloaded TCP/IP Stack)
 
+### What "Kernel Changes" Means In This Project
+
+In this STM32 project, "kernel changes" usually means **RTOS configuration and project setup**, not editing FreeRTOS kernel internals.
+
+In practice, our kernel-level work is:
+- Tuning FreeRTOS behavior via `Core/Inc/FreeRTOSConfig.h` (preemption, tick rate, heap size, syscall-safe IRQ priority boundaries).
+- Configuring NVIC/peripherals and CMSIS-RTOS options in `ems-rtos-mini.ioc` (STM32CubeIDE/CubeMX generated settings).
+- Defining task/queue setup and startup flow in `Core/Src/main.c` (thread priorities, stack sizes, queue depths, scheduler start).
+
+This is different from Linux-style kernel development, where "kernel changes" means patching scheduler/driver source code directly.
+
 ---
 
 <a id="sec-2"></a>
