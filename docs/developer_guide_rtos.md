@@ -2176,6 +2176,241 @@ A common question is: *"If DMA is so great for Modbus, why don't we use DMA for 
 *   **The Reality:** The `HAL_CAN_RxFifo0MsgPendingCallback()` ISR is extraordinarily fast. It takes less than **1 microsecond** for the Cortex-M4 CPU to execute. It simply executes 3 native ARM assembly instructions to copy 8 bytes from the hardware mailbox register directly into checking our FreeRTOS `queueCanRxHandle` (an expandable 16-element deep RAM queue).
 *   **The Fix:** This nanosecond ISR prevents the hardware mailbox from dropping frames. Later, when `Task_Poll` runs at its leisure, it casually drains this FreeRTOS software queue (`osMessageQueueGet(..., 0)` - *non-blocking*) without having dropped a single frame from the batteries.
 
+#### CAN Packet Format: RTOS (J1939-Simple) vs cem-app (J1939-Complex)
+
+**Important Clarification:** Both projects use CAN as the physical layer, but they use **different approaches to CAN message encoding**. Here's the detailed comparison:
+
+##### RTOS (STM32 ems-mini-rtos): Simple 11-Bit CAN IDs
+
+The RTOS project uses **direct 11-bit CAN identifiers** with simple, device-specific ID mappings—**NOT full J1939**:
+
+```c
+// From bms_can.h
+#define BMS_ID_VOLTAGE_CURRENT  0x0356  // 11-bit ID for voltage/current
+#define BMS_ID_SOC_SOH          0x0355  // 11-bit ID for SOC/SOH
+#define BMS_ID_ALARM_WARN       0x0359  // 11-bit ID for alarms
+#define BMS_ID_LIMITS           0x035A  // 11-bit ID for charge/discharge limits
+
+// Received packet structure
+typedef struct {
+    uint32_t  id;            // 11-bit standard ID (0x000 - 0x7FF)
+    uint8_t   data[8];       // Up to 8 bytes of payload
+    uint8_t   dlc;           // Data Length Code (valid bytes in data)
+    uint8_t   isExtended;    // Always 0 for 11-bit IDs
+} CanFrame_t;
+
+// Example parsing for Voltage/Current frame (ID 0x0356)
+if (rxFrame.dlc >= 4) {
+    uint16_t voltage = (rxFrame.data[1] << 8) | rxFrame.data[0];  // Little-endian
+    int16_t current = (int16_t)((rxFrame.data[3] << 8) | rxFrame.data[2]);
+}
+```
+
+**Packet Format (Raw):**
+```
+CAN Frame from Battery (ID 0x0356):
+┌─────────────────────────────────────────────┐
+│ CAN ID: 0x356 (11-bit)                      │
+│ DLC: 8 bytes                                │
+│ Byte 0-1: Voltage (Little-endian, 100mV units) │
+│ Byte 2-3: Current (Little-endian signed, 100mA units) │
+│ Byte 4-7: Unused (0xFF padding)             │
+└─────────────────────────────────────────────┘
+
+Example data: [0x4B, 0x1E, 0xFF, 0x64, 0xFF, 0xFF, 0xFF, 0xFF]
+              └─ Volts ─┘ └─ Current ┘
+  → Voltage = 0x1E4B = 7755 × 100mV = 775.5V
+  → Current = 0x64FF = 25855 × 100mA = 2585.5A (actually signed, so -458.5A in practice)
+```
+
+**Characteristics:**
+- ✅ **Simple:** Each ID corresponds to a specific data structure
+- ✅ **Fast:** No header parsing, direct byte access
+- ✅ **Lightweight:** Minimal RAM/CPU for parsing
+- ❌ **Not J1939:** No PGN (Parameter Group Number), no SAE standardization
+- ❌ **Proprietary:** Specific to the battery BMS vendor (e.g., Pylontech, CATL)
+- ❌ **Inflexible:** Changing data format requires firmware update
+
+---
+
+##### cem-app (IMX93 Linux): Full J1939 Extended 29-Bit IDs
+
+The `cem-app` project running on IMX93 uses **full J1939 protocol** with extended 29-bit CAN identifiers:
+
+```c
+// From can_message_header.h
+struct CanRequest_t {
+    GE_UINT8 priority;       // 3 bits: Priority level (0-7, lower=higher priority)
+    GE_UINT8 pdu_format;     // 8 bits: Protocol Data Unit Format (PF)
+    GE_UINT8 ps;             // 8 bits: PDU Specific (PS) - PS or Group Extension
+    GE_UINT8 source_addr;    // 8 bits: Source Address (SA) of sender
+    std::array<GE_UINT8, 8> payload;  // 8 bytes of data
+};
+
+struct CanResponse_t {
+    GE_UINT8 priority;
+    GE_UINT8 pdu_format;
+    GE_UINT8 ps;
+    GE_UINT8 source_addr;
+    GE_UINT32 can_id;        // Full 29-bit Extended CAN ID
+    std::array<GE_UINT8, 8> data;
+    GE_UINT8 len;
+};
+
+// J1939 CAN ID construction
+uint32_t j1939_id = (priority << 26) | (pdu_format << 16) | (ps << 8) | source_addr;
+// Example: 0x18FF50E5 = priority(0) + PF(0xFF) + PS(0x50) + SA(0xE5)
+```
+
+**Packet Format (J1939-Encoded):**
+```
+J1939 Extended Frame from Battery (PGN 0xFFF50):
+┌──────────────────────────────────────────────────┐
+│ CAN ID: 0x18FF50E5 (29-bit Extended)             │
+│   ├─ Priority (bits 26-28): 0x0 (priority 0)     │
+│   ├─ PDU Format (bits 16-23): 0xFF (broadcast)   │
+│   ├─ PDU Specific (bits 8-15): 0x50 (PGN 0xFF50) │
+│   └─ Source Address (bits 0-7): 0xE5 (device ID) │
+│ DLC: 8 bytes                                      │
+│ Data: Parsed using J1939 SPN mapping             │
+└──────────────────────────────────────────────────┘
+
+Example J1939 PGN 65271 (0xFEF7 - Vehicle Electrical Power #3):
+Byte 0: Charge/Discharge Command
+Byte 1-2: Battery State of Charge (SPN 158)
+  Value: 0x4B1E = 19230 × 0.4% = 76.92% SOC
+Byte 3-4: Battery Voltage (SPN 168)
+  Value: 0xFF64 × 0.05V - 1600V = 1669V
+Byte 5-6: Battery Current
+Byte 7: Status and Alarms
+```
+
+**Characteristics:**
+- ✅ **Standardized:** SAE J1939 international protocol
+- ✅ **Flexible:** PGN system allows multi-vendor interoperability
+- ✅ **Extensible:** SPN (Suspect Parameter Number) system for precise data meaning
+- ✅ **Safe:** Priority field ensures critical messages preempt less important ones
+- ✅ **Interoperable:** Can communicate with industry-standard equipment (trucks, marine engines, industrial controllers)
+- ❌ **Complex:** Requires header parsing layer
+- ❌ **CPU overhead:** Linux cem-app can afford it; STM32 RTOS avoids it
+
+---
+
+##### Why the Difference? RTOS vs Linux Philosophies
+
+| Aspect | RTOS (STM32 ems-mini-rtos) | Linux (IMX93 cem-app) |
+| :--- | :--- | :--- |
+| **CAN ID scheme** | 11-bit simple IDs (0x0356, 0x0355, etc) | 29-bit J1939 extended IDs |
+| **Parsing complexity** | 0 CPU cycles — direct array indexing | Parse priority/PF/PS/SA fields |
+| **Battery vendor lock-in** | Yes — Pylontech/CATL specific | No — J1939 is universal |
+| **Scalability** | Limited to 2047 unique IDs | 536 million+ unique addresses |
+| **Interop with grid equipment** | No — proprietary BMS protocol | Yes — matches inverters, meters |
+| **CPU overhead** | <1µs per frame | ~5-10µs per frame (parsing) |
+| **RAM footprint** | Minimal (~300 bytes for queue) | Moderate (parsing buffers) |
+| **Best for** | Real-time edge controller (must be fast) | Feature-rich orchestrator (can afford parsing) |
+
+---
+
+##### Practical Example: Reading the Same Battery State from Both
+
+**Goal:** Extract `SOC = 77%` and `Voltage = 1669V` from the battery.
+
+**RTOS Approach (11-bit CAN, Little-Endian):**
+```c
+// Task_Poll receives raw CAN frame
+CanFrame_t frame = { .id = 0x0356, .dlc = 8, 
+                     .data = {0x4B, 0x1E, 0xFF, 0x64, 0x00, 0x00, 0xFF, 0xFF} };
+
+// Direct byte access — NO parsing needed
+uint16_t voltage_100mV = (frame.data[1] << 8) | frame.data[0];  // = 0x1E4B = 7755
+uint16_t current_100mA = (int16_t)((frame.data[3] << 8) | frame.data[2]);
+
+float voltage_V = voltage_100mV * 0.1;  // 7755 * 0.1 = 775.5V
+float current_A = current_100mA * 0.1;  // device-specific formula
+
+// SOC from separate 0x0355 frame
+CanFrame_t soc_frame = { .id = 0x0355, .dlc = 2, 
+                        .data = {0xC3, 0x00} };  // 195 = 77.5%
+float soc_pct = soc_frame.data[0] * 0.4;  // Vendor-specific: 0.4% per LSB
+```
+
+**cem-app Approach (J1939 29-bit, SAE Standard):**
+```c
+// Task receives J1939 frame
+CanResponse_t frame = { 
+    .can_id = 0x18FF50E5,  // PGN 0xFF50, SA=0xE5
+    .pdu_format = 0xFF,
+    .ps = 0x50,
+    .source_addr = 0xE5,
+    .data = {0x4B, 0x1E, 0xFF, 0x64, 0x00, 0x00, 0xFF, 0xFF}
+};
+
+// Parse J1939 header to determine which PGN was received
+uint16_t pgn = (frame.pdu_format << 8) | (frame.ps);  // = 0xFF50
+
+if (pgn == 0xFEF7) {  // "Vehicle Electrical Power #3"
+    // SPN 158: Battery State of Charge (bytes 1-2, big-endian)
+    uint16_t soc_raw = (frame.data[1] << 8) | frame.data[2];
+    float soc_pct = soc_raw * 0.4;  // J1939 scaling: 0.4% per bit
+    
+    // SPN 168: Battery Voltage (bytes 3-4, big-endian)
+    uint16_t voltage_raw = (frame.data[3] << 8) | frame.data[4];
+    float voltage_V = (voltage_raw * 0.05) - 1600.0;  // J1939 offset: -1600V
+    
+    // SPN 159: Battery Current (bytes 5-6)
+    int16_t current_raw = (frame.data[5] << 8) | frame.data[6];
+    float current_A = (current_raw * 0.05);  // J1939: 0.05A per bit, signed
+}
+```
+
+---
+
+##### What Changes When Data Transitions Between Systems?
+
+**Scenario:** Battery telemetry flows through the network:
+1. **Battery BMS broadcasts** on CAN (either 11-bit or J1939)
+2. **RTOS receives & queues** the frame
+3. **RTOS publishes to cloud** via MQTT (JSON format)
+4. **cem-app (IMX93) reads** the same battery state from MQTT
+
+**The data transformation:**
+
+```
+Battery (BMS)
+  11-bit ID 0x0356
+  Raw bytes: [0x4B, 0x1E, 0xFF, 0x64, ...]
+    ↓
+  RTOS Task_Poll
+  ├─ Parse as simple ID: voltage=(0x1E4B) × 100mV = 775.5V
+  ├─ Queue as SystemState_t struct
+  └─ Publish as JSON: {"voltage_V": 775.5, "soc_pct": 77.5, ...}
+    ↓
+  MQTT Cloud Broker
+  (JSON payload)
+    ↓
+  cem-app Task (Linux/IMX93)
+  └─ Parse JSON, reconstruct SystemState_t locally
+    (No CAN parsing needed — already parsed by RTOS)
+```
+
+**Key Point:** The **RTOS acts as the CAN protocol translator** for the cem-app. The RTOS:
+- ✅ Handles low-level 11-bit CAN or J1939 decoding
+- ✅ Converts to unified `SystemState_t` struct
+- ✅ Publishes as JSON over MQTT
+
+The cem-app:
+- ✅ Receives structured JSON (no CAN decoding needed)
+- ✅ Works at higher logic/scheduling level
+- ✅ Can switch battery BMS vendors without recompilation (if RTOS is recompiled once)
+
+---
+
+**Summary:** The RTOS uses **simple 11-bit CAN** for raw speed and minimal CPU overhead, while cem-app could theoretically support **full J1939** if the local battery vendor broadcast J1939 packets. However, in practice:
+- RTOS MUST use the battery's native protocol (often proprietary 11-bit or simple J1939)
+- RTOS translates that into a unified `SystemState_t` struct ✓
+- cem-app receives the unified struct via MQTT (JSON) — no raw CAN parsing needed ✓
+- This design decouples cem-app from CAN protocol evolution ✓
+
 ---
 
 <a id="sec-14"></a>
