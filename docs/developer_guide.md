@@ -2195,6 +2195,67 @@ To achieve this, we had to "decouple" the project into two binaries that can nev
 
 Each binary is a separate project. At the factory, we flash **both** using two commands, creating a secure trust chain.
 
+### 📂 Why doesn't this folder contain MCUboot?
+
+In a professional energy project, we use a **"Separation of Concerns"** repository strategy:
+
+1.  **Application Repo (`/ems-mini-rtos`)**: This is what you have open. It contains the FreeRTOS tasks, the Modbus logic, and the Cloud connectivity.
+2.  **Product Security Repo (Separate)**: This contains the MCUboot source code and, most importantly, the **Private Signing Keys**. 
+
+**Why separate them?**
+If a developer accidentally pushes a bug to the application, it only affects the app. However, if the **Bootloader** is corrupted or the **Private Keys** are leaked because they were in the same folder, the entire security of the product is destroyed. By keeping the bootloader in a separate, restricted repository, we ensure the "Root of Trust" is protected from accidental day-to-day code changes in the application.
+
+### ❓ So how do I build the whole thing from scratch?
+
+1.  **Obtain `mcuboot.bin`**: This is usually provided as a pre-built binary by the security architect or built from a separate specialized repository.
+2.  **Build our App**: In this directory, run your CubeIDE build to get `ems_rtos.bin`.
+3.  **Sign it**: Use `imgtool` to merge your app with the security metadata.
+4.  **Flash**: Flash both binaries (Bootloader at `0x08000000`, Signed App at `0x08040000`).
+
+### 🔐 The Mechanics of Asymmetric Trust
+
+You asked: *"How does downloading a binary secure the project with our keys?"*
+
+The answer lies in **Asymmetric Cryptography** (ECDSA P-256). We use a pair of keys that are mathematically linked but functionally separate:
+
+1.  **The Public Key (`root-ec-p256.pub`)**: This is baked **inside** the `mcuboot.bin`. It is like a "Lock." It can be shared and seen by anyone, but it cannot be used to sign anything.
+2.  **The Private Key (`root-ec-p256.pem`)**: This is kept secret on your build server or local machine. It is the only "Key" that can open the lock.
+
+```mermaid
+sequenceDiagram
+    participant PC as PC / Build Server (Private Key)
+    participant HW as STM32 Hardware (Public Key)
+    
+    Note over PC: 1. Build CubeIDE App (ems_rtos.bin)
+    PC->>PC: 2. Run imgtool sign --key root-ec-p256.pem
+    Note right of PC: Generates digital signature
+    
+    Note over HW: 3. Hardware Resets
+    HW->>HW: 4. MCUboot reads Public Key from its own binary
+    HW->>HW: 5. MCUboot reads Signature from App slot
+    
+    alt Signature Matches Public Key
+        Note over HW: TRUST VERIFIED
+        HW->>HW: 6. Jumps to App (FreeRTOS)
+    else Signature Invalid
+        Note over HW: TRUST FAILED
+        HW->>HW: 6. System Hangs / Bricks
+    end
+```
+
+### ❓ Does just "downloading" mcuboot.bin work?
+
+**Only if the Public Key inside that binary matches the Private Key you used to sign the app.** 
+
+When we say "download the binary," we mean obtaining a version of MCUboot that was compiled specifically for your organization's security profile. If you download a generic `mcuboot.bin` from the internet, it won't have your key, and it will reject your signed app every time.
+
+**The Provisioning Flow:**
+1.  **Creation**: Use OpenSSL to generate a new key pair.
+2.  **Embedding**: Put the **Public Key** into the MCUboot source code and compile `mcuboot.bin`.
+3.  **Deployment**: Flash this "Customized" `mcuboot.bin` to the STM32. Now that chip is "Tied" to your organization.
+4.  **Signing**: Every time you build your app, use the **Private Key** to sign it.
+5.  **Success**: Since the hardware has the matching Public Key, it will trust your app forever.
+
 ```
  Flash Memory Map (1MB = 0x08000000 to 0x080FFFFF)
  ═══════════════════════════════════════════════════════════════════
@@ -2222,7 +2283,54 @@ Each binary is a separate project. At the factory, we flash **both** using two c
  │  384 KB (mirror of Bank 1)              │
  └─────────────────────────────────────────┘ 0x080FFFFF
 ```
+### 🛠️ The 3-Stage Development Workflow
 
+One of the most common points of confusion is: *"I only see one project in STM32CubeIDE. Where is the bootloader code?"*
+
+In a professional industrial setup, the **Bootloader** and the **Application** are two strictly separate entities. You do not build them at the same time.
+
+#### Stage 1: The MCUboot Project (The Gatekeeper)
+*   **Where is it?** It lives in a separate folder (`/bootloader/mcuboot`) or a separate Git submodule.
+*   **Is it in `/ems-mini-rtos`?** **No.** Your current directory contains only the Application code. 
+*   **Build Method**: You open this as its own workspace in CubeIDE or build it via a `Makefile`. It contains the logic to verify signatures and the **Public Key** (`root-ec-p256.pub`).
+*   **Update Frequency**: You build and flash this **ONCE** during factory provisioning. It rarely changes.
+*   **Flashing**: `st-flash write mcuboot.bin 0x08000000`
+
+#### Stage 2: The Main EMS Application (Our Project)
+*   **Where is it?** This is the project you see in your current CubeIDE window.
+*   **Build Method**: Standard Build in CubeIDE.
+*   **The Output**: This generates `ems_rtos.bin`.
+*   **⚠️ CRITICAL**: You **cannot** flash this `ems_rtos.bin` directly to the chip yet! Why? Because it lacks the "Signed Header" that MCUboot expects. If you flash this raw file to `0x08040000`, MCUboot will look at it, see no signature, and refuse to boot.
+
+#### Stage 3: The Signing Step (`imgtool`)
+This is the "Secret Sauce" that bridges the two projects. After you build your app in CubeIDE, you must run a Python tool called **`imgtool`**:
+
+```bash
+# 1. Take the raw CubeIDE binary
+# 2. Add a 1KB header at the start
+# 3. Add a digital signature at the end using your Private Key
+# 4. Save as a "Signed" image
+imgtool sign --key root-ec-p256.pem \
+             --header-size 0x400 \
+             --align 8 \
+             --slot-size 0x60000 \
+             --version 1.0.0 \
+             ems_rtos.bin ems_rtos_signed.bin
+```
+
+*   **Result**: Now you have `ems_rtos_signed.bin`.
+*   **Flashing**: `st-flash write ems_rtos_signed.bin 0x08040000`
+
+### 🔄 The "Complete Trust Chain" Summary
+1.  **Hardware Reset** jumps to `0x08000000` (MCUboot).
+2.  **MCUboot** reads the header of the file at `0x08040000` (The Signed App).
+3.  **MCUboot** uses its internal Public Key to verify the App's Signature.
+4.  **Verification Success** → MCUboot jumps core to `0x08040000 + offset`.
+5.  **FreeRTOS** starts running.
+
+### What changes did we do in our App to support this?
+1.  **Linker Script**: We changed `ORIGIN = 0x08000000` to `ORIGIN = 0x08040400`. We left a **0x400 (1024 byte) hole** at the start of the memory map to make room for the MCUboot Image Header.
+2.  **Vector Table Offset**: We updated the `VTOR` register in `system_stm32f4xx.c` so the CPU knows the interrupt table has moved from the default position to the new app start address.
 **Our Modified Linker Script (`STM32F407VGTX_FLASH.ld`):**
 ```text
 MEMORY
